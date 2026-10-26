@@ -4,7 +4,36 @@ import { el } from "../core/events";
 import { Game } from "../game/game";
 import { ipToStr, parseIp } from "../net/ip";
 import { TraceResult } from "../net/sim";
-import { CATALOG } from "../net/model";
+import { CATALOG, DeviceConfig, FIRMWARE } from "../net/model";
+
+/** Render a configuration the way a device would print it. */
+export function formatConfig(cfg: DeviceConfig, kind: string): string {
+  const out: string[] = [`hostname ${cfg.name}`, "!"];
+  for (const [name, i] of Object.entries(cfg.ifaces)) {
+    out.push(`interface ${name}`);
+    if (i.description) out.push(`  description ${i.description}`);
+    if (i.mode === "dhcp") out.push("  ip address dhcp");
+    else if (i.mode === "static" && i.ip) out.push(`  ip address ${i.ip}/${i.prefix ?? 24}`);
+    if (i.gateway) out.push(`  default-gateway ${i.gateway}`);
+    if (i.dns) out.push(`  dns-server ${i.dns}`);
+    if (i.nat) out.push("  ip nat outside");
+    if (i.dhcp?.enabled) out.push(`  dhcp-server ${i.dhcp.start} ${i.dhcp.end} gateway ${i.dhcp.gateway || "-"} dns ${i.dhcp.dns || "-"}`);
+    if (i.speed && i.speed !== "auto") out.push(`  speed ${i.speed}`);
+    if (i.duplex && i.duplex !== "auto") out.push(`  duplex ${i.duplex}`);
+    out.push(i.enabled === false ? "  shutdown" : "  no shutdown");
+    out.push("!");
+  }
+  for (const r of cfg.routes ?? []) out.push(`ip route ${r.dest}/${r.prefix} ${r.via}`);
+  for (const a of cfg.acl ?? []) out.push(`access-list ${a.action} ${a.proto} ${a.src || "any"} ${a.dst || "any"}`);
+  if (cfg.services?.http?.enabled) out.push(`service http hostnames ${cfg.services.http.hostnames.join(",") || "-"}`);
+  if (cfg.services?.dns?.enabled) {
+    out.push(`service dns forwarder ${cfg.services.dns.forwarder || "-"}`);
+    for (const r of cfg.services.dns.records) out.push(`  dns record ${r.name} ${r.ip}`);
+  }
+  if (kind === "switch") out.push("spanning-tree disabled");
+  out.push("end");
+  return out.join("\n");
+}
 
 const HELP = `Commands:
   ip                 show this device's interfaces, MAC and IP addresses
@@ -16,12 +45,24 @@ const HELP = `Commands:
   arp                show the ARP cache (IP → MAC of neighbours on the local network)
   dhcp               replay the DHCP conversation for this host (DISCOVER/OFFER/REQUEST/ACK)
   log                show this device's event log
+  show running-config / show startup-config / show version / show interfaces
+  write              save the running configuration (survives reboots and power cuts)
+  reload             reboot the device; unsaved configuration is lost
+  backup [label]     keep a copy of the running configuration;  restore <n> brings one back
+  interface <port> shutdown | no shutdown | speed auto|100|1000 | duplex auto|full|half | description <text>
+  hostname <name>
   clear              clear the screen
 Tab completes commands, device names, hostnames and addresses.`;
 
 const SWITCH_HELP = `Switch console:
   show mac-address-table   which MAC addresses were learned on which port
   show interfaces          port status, speed and what is plugged in
+  show running-config / show startup-config / show version
+  write                    save the running configuration
+  reload                   reboot (unsaved configuration is lost)
+  backup [label] / restore <n>
+  interface <port> shutdown | no shutdown | speed auto|100|1000 | duplex auto|full|half | description <text>
+  hostname <name>
   log                      event log
   clear`;
 
@@ -78,7 +119,8 @@ export class Terminal {
   private complete() {
     const v = this.input.value;
     const parts = v.split(/\s+/);
-    const commands = this.dev.kind === "switch" ? ["help", "show mac-address-table", "show interfaces", "log", "clear"] : ["help", "ip", "ping", "trace", "nslookup", "curl", "route", "arp", "dhcp", "log", "clear"];
+    const ops = ["show running-config", "show startup-config", "show version", "show interfaces", "write", "reload", "backup", "restore", "interface", "hostname"];
+    const commands = this.dev.kind === "switch" ? ["help", "show mac-address-table", ...ops, "log", "clear"] : ["help", "ip", "ping", "trace", "nslookup", "curl", "route", "arp", "dhcp", ...ops, "log", "clear"];
     let pool: string[];
     if (parts.length <= 1) pool = commands;
     else {
@@ -166,6 +208,7 @@ export class Terminal {
     this.print(`$ ${cmdline}`, "cmd");
     const [cmd, ...args] = cmdline.split(/\s+/);
     const arg = args.join(" ");
+    if (this.runOps(cmd.toLowerCase(), args)) return;
     if (dev.kind === "switch") return this.runSwitch(cmd.toLowerCase(), args);
     switch (cmd.toLowerCase()) {
       case "help":
@@ -176,6 +219,16 @@ export class Terminal {
       case "logs":
         this.printLog();
         break;
+      case "show": {
+        if (arg.toLowerCase().startsWith("int")) {
+          for (const p of dev.ifaces) {
+            const st = g.net.linkState(p);
+            const link = g.net.linkOf(p.id);
+            this.print(`${p.name.padEnd(5)} ${p.enabled === false ? "admin-down" : st.padEnd(10)} ${link ? g.net.linkSpeed(link).padEnd(22) : "".padEnd(22)} ${g.net.describeIface(p)}${p.description ? `  "${p.description}"` : ""}`, st === "down" ? "bad" : "");
+          }
+        } else this.print("show what? running-config | startup-config | version | interfaces", "muted");
+        break;
+      }
       case "dhcp": {
         if (!dev.power) return this.print("device is powered off", "bad");
         for (const st of g.net.dhcpTransaction(dev.id)) this.print(`${st.label.padEnd(9)} ${st.text}`, st.ok ? (st.label === "ACK" ? "good" : "") : "bad");
@@ -333,6 +386,107 @@ export class Terminal {
       default:
         this.print(`unknown command: ${cmd}. Type help.`, "bad");
     }
+  }
+
+  /** Commands every managed device understands. Returns true when handled. */
+  private runOps(cmd: string, args: string[]): boolean {
+    const g = this.game;
+    const dev = this.dev;
+    const sub = args.map((a) => a.toLowerCase());
+    if (cmd === "show" && (sub[0] === "running-config" || sub[0] === "run")) {
+      this.print(formatConfig(g.net.extractConfig(dev), dev.kind));
+      if (g.net.isDirty(dev)) this.print("! running configuration differs from startup-config (not saved)", "hint");
+      g.flags.add(`showrun:${dev.id}`);
+      return true;
+    }
+    if (cmd === "show" && (sub[0] === "startup-config" || sub[0] === "start")) {
+      this.print(dev.startup ? formatConfig(dev.startup, dev.kind) : "startup-config is not present (factory defaults will load on reboot)", dev.startup ? "" : "hint");
+      return true;
+    }
+    if (cmd === "show" && sub[0] === "version") {
+      this.print(`${dev.name}  model ${CATALOG[dev.kind].label}\nfirmware ${dev.firmware}${dev.firmware !== FIRMWARE[dev.kind].latest ? `  (update available: ${FIRMWARE[dev.kind].latest})` : "  (latest)"}\nuptime ${g.net.uptime(dev)}\nconfiguration ${g.net.isDirty(dev) ? "MODIFIED (unsaved)" : "saved"}`);
+      return true;
+    }
+    if (cmd === "write" || cmd === "wr" || (cmd === "copy" && sub[0]?.startsWith("run"))) {
+      g.net.saveConfig(dev.id);
+      g.flags.add(`write:${dev.id}`);
+      g.save();
+      this.print("Building configuration... [OK]", "good");
+      g.events.emit("change", undefined);
+      return true;
+    }
+    if (cmd === "reload" || cmd === "reboot") {
+      const lost = g.net.isDirty(dev);
+      this.print(lost ? "Warning: running configuration has not been saved and will be lost." : "Rebooting…", lost ? "hint" : "muted");
+      g.net.reboot(dev.id);
+      g.flags.add(`reload:${dev.id}`);
+      g.recompute();
+      g.save();
+      g.events.emit("change", undefined);
+      return true;
+    }
+    if (cmd === "backup") {
+      const b = g.net.backup(dev.id, args.join(" "));
+      this.print(`Saved backup "${b?.label}" (${dev.backups?.length} kept).`, "good");
+      g.flags.add(`backup:${dev.id}`);
+      g.save();
+      g.events.emit("change", undefined);
+      return true;
+    }
+    if (cmd === "restore") {
+      const n = Number(args[0]);
+      if (!dev.backups?.length) this.print("No backups on this device.", "bad");
+      else if (!Number.isInteger(n) || n < 1 || n > dev.backups.length) {
+        this.print("Backups:", "muted");
+        dev.backups.forEach((b, i) => this.print(`  ${i + 1}. ${b.label}  (${b.t})`));
+      } else {
+        g.net.restore(dev.id, n - 1);
+        this.print(`Running configuration restored from "${dev.backups[n - 1].label}". Use write to keep it.`, "good");
+        g.recompute();
+        g.save();
+        g.events.emit("change", undefined);
+      }
+      return true;
+    }
+    if (cmd === "hostname") {
+      const name = args.join(" ").trim();
+      if (!name) return (this.print("usage: hostname <name>", "muted"), true);
+      dev.name = name;
+      g.save();
+      g.events.emit("change", undefined);
+      this.print(`hostname set to ${name}`, "good");
+      return true;
+    }
+    if (cmd === "interface" || cmd === "int") {
+      const port = dev.ifaces.find((i) => i.name.toLowerCase() === sub[0]);
+      if (!port) return (this.print(`no such interface. Ports: ${dev.ifaces.map((i) => i.name).join(", ")}`, "bad"), true);
+      if (port.locked) return (this.print("that interface is managed by the provider", "bad"), true);
+      const verb = sub[1];
+      const rest = args.slice(2);
+      if (verb === "shutdown") port.enabled = false;
+      else if (verb === "no" && sub[2] === "shutdown") port.enabled = undefined;
+      else if (verb === "speed" && ["auto", "100", "1000"].includes(sub[2])) port.speed = sub[2] as "auto";
+      else if (verb === "duplex" && ["auto", "full", "half"].includes(sub[2])) port.duplex = sub[2] as "auto";
+      else if (verb === "description") port.description = rest.join(" ");
+      else if (verb === "ip" && sub[2] === "address") {
+        if (sub[3] === "dhcp") port.mode = "dhcp";
+        else {
+          const m = /^(\d+\.\d+\.\d+\.\d+)\/(\d+)$/.exec(sub[3] ?? "");
+          if (!m) return (this.print("usage: interface <port> ip address <a.b.c.d>/<prefix> | dhcp", "muted"), true);
+          port.mode = "static";
+          port.ip = m[1];
+          port.prefix = Number(m[2]);
+        }
+      } else return (this.print("usage: interface <port> shutdown | no shutdown | speed auto|100|1000 | duplex auto|full|half | description <text> | ip address <addr>/<prefix>|dhcp", "muted"), true);
+      g.net.log(dev.id, `${port.name}: ${args.slice(1).join(" ")}`);
+      g.net.touch();
+      g.recompute();
+      g.save();
+      g.events.emit("change", undefined);
+      this.print(`${port.name}: ${g.net.describeIface(port)} · link ${g.net.linkState(port)}`, "good");
+      return true;
+    }
+    return false;
   }
 
   private printLog() {

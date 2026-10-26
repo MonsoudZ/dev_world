@@ -506,6 +506,18 @@ export class Panels {
         },
         g.rainTarget > 0 ? "☀ Clear weather" : "🌧 Make it rain"
       ),
+      el(
+        "button",
+        {
+          class: "btn small",
+          onclick: () => {
+            const bid = g.selected ?? "workshop";
+            if (g.mainsIsOut(bid)) g.restoreMains(bid);
+            else g.cutMains(bid, 90);
+          },
+        },
+        "🔌 Cut mains at selected building"
+      ),
       el("button", { class: "btn small ghost", onclick: () => this.showNotes() }, "📓 Field notes")
     );
   }
@@ -621,4 +633,7 @@ const GLOSSARY: Record<string, string> = {
   HTTP: "The web protocol. A server listens on port 80 and answers for the hostnames it is configured to serve.",
   "Firewall rule": "A router filter: allow or deny traffic by source, destination and protocol. First match wins.",
   Troubleshooting: "Bottom-up: link, address, gateway, name, service. A trace shows the hop where things stopped.",
+  "Running vs startup config": "Changes apply immediately to the running configuration; only what you save (write) survives a reboot or power cut.",
+  "Duplex mismatch": "One end forced, the other on auto: the link comes up but collides constantly. Keep both ends on auto or force both the same.",
+  UPS: "Battery backup for the rack. Gear on its outlets rides through a mains cut until the battery is flat; the PDU has a power budget too.",
 };

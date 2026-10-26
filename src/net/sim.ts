@@ -3,7 +3,7 @@
 // latency, device boot time and per-device event logs. Every operation returns a hop-by-hop
 // trace with plain-language explanations so failures teach instead of just failing.
 
-import { Device, DeviceKind, Iface, Lease, Link, LogEntry, MEDIA, Medium, NetworkSnapshot, Proto, createDevice, isRouterKind } from "./model";
+import { ConfigBackup, Device, DeviceConfig, DeviceKind, FIRMWARE, Iface, Lease, Link, LogEntry, MEDIA, Medium, NetworkSnapshot, Proto, createDevice, isRouterKind } from "./model";
 import { inCidr, ipToStr, isValidHostAddress, parseIp, sameSubnet, isPrivate } from "./ip";
 
 export interface EffectiveAddr {
@@ -99,6 +99,7 @@ const DEV_INFO: Record<DeviceKind, string> = {
   server: "a server",
   modem: "the ISP modem",
   cloud: "the internet",
+  ups: "a UPS",
 };
 
 /** Seconds a device takes to come up after power-on. */
@@ -110,6 +111,7 @@ export const BOOT_SECONDS: Record<DeviceKind, number> = {
   server: 14,
   modem: 18,
   cloud: 0,
+  ups: 2,
 };
 
 /** Per-packet processing delay in milliseconds. */
@@ -121,6 +123,7 @@ const PROCESSING_MS: Record<DeviceKind, number> = {
   server: 0.1,
   modem: 0.6,
   cloud: 0.2,
+  ups: 0,
 };
 
 type Segment = { ifaces: Iface[]; paths: Map<string, { via: string[]; links: string[] }>; issues: string[] };
@@ -148,7 +151,11 @@ export class Network {
     for (const d of snap.devices) {
       for (const i of d.ifaces) if (!i.mac) i.mac = `02:4d:48:${d.id.length.toString(16).padStart(2, "0")}:00:${i.name.length.toString(16).padStart(2, "0")}`;
       d.bootingUntil = undefined;
+      if (!d.firmware) d.firmware = FIRMWARE[d.kind].initial;
+      if (d.powerSource === undefined && ["switch", "router", "server", "modem", "ups"].includes(d.kind)) d.powerSource = "pdu";
       this.devices.set(d.id, d);
+      // Older saves predate saved configs: treat what they have as saved.
+      if (!d.startup) d.startup = this.extractConfig(d);
     }
     for (const l of snap.links) this.links.set(l.id, { ...l, medium: l.medium ?? "copper", lengthM: l.lengthM ?? 3 });
     this.touch();
@@ -172,6 +179,105 @@ export class Network {
     if (!d || d.hidden) return;
     (d.log ??= []).push({ t: this.clock(), text, kind });
     if (d.log.length > 80) d.log.shift();
+  }
+
+  // ----------------------------------------------------------- configuration (running vs startup)
+  extractConfig(d: Device): DeviceConfig {
+    const ifaces: DeviceConfig["ifaces"] = {};
+    for (const i of d.ifaces) {
+      ifaces[i.name] = { mode: i.mode, ip: i.ip, prefix: i.prefix, gateway: i.gateway, dns: i.dns, nat: i.nat, dhcp: i.dhcp ? { ...i.dhcp } : undefined, enabled: i.enabled, speed: i.speed, duplex: i.duplex, description: i.description };
+    }
+    return JSON.parse(JSON.stringify({ name: d.name, ifaces, routes: d.routes, acl: d.acl, services: d.services }));
+  }
+
+  applyConfig(d: Device, cfg: DeviceConfig) {
+    const c: DeviceConfig = JSON.parse(JSON.stringify(cfg));
+    d.name = c.name;
+    for (const i of d.ifaces) {
+      const ic = c.ifaces[i.name];
+      if (!ic) continue;
+      if (i.locked) continue;
+      Object.assign(i, { mode: ic.mode, ip: ic.ip, prefix: ic.prefix, gateway: ic.gateway, dns: ic.dns, nat: ic.nat, dhcp: ic.dhcp, enabled: ic.enabled, speed: ic.speed, duplex: ic.duplex, description: ic.description });
+      i.lease = undefined;
+    }
+    d.routes = c.routes ?? [];
+    d.acl = c.acl ?? [];
+    d.services = c.services ?? {};
+  }
+
+  /** Factory defaults: what a device runs with when it has never been saved. */
+  factoryConfig(d: Device): DeviceConfig {
+    const fresh = createDevice(d.kind, d.id, d.name, d.buildingId);
+    const cfg = this.extractConfig(fresh);
+    cfg.name = d.name;
+    return cfg;
+  }
+
+  isDirty(d: Device): boolean {
+    if (d.kind === "cloud" || d.kind === "ups") return false;
+    const run = JSON.stringify(this.extractConfig(d));
+    const start = JSON.stringify(d.startup ?? this.factoryConfig(d));
+    return run !== start;
+  }
+
+  saveConfig(deviceId: string) {
+    const d = this.devices.get(deviceId);
+    if (!d) return;
+    d.startup = this.extractConfig(d);
+    this.log(deviceId, "Configuration saved to startup-config.");
+  }
+
+  backup(deviceId: string, label?: string): ConfigBackup | undefined {
+    const d = this.devices.get(deviceId);
+    if (!d) return undefined;
+    const b: ConfigBackup = { t: this.clock(), label: label || `backup ${(d.backups?.length ?? 0) + 1}`, config: this.extractConfig(d) };
+    (d.backups ??= []).push(b);
+    if (d.backups.length > 6) d.backups.shift();
+    this.log(deviceId, `Configuration backed up: "${b.label}".`);
+    return b;
+  }
+
+  restore(deviceId: string, index: number): boolean {
+    const d = this.devices.get(deviceId);
+    const b = d?.backups?.[index];
+    if (!d || !b) return false;
+    this.applyConfig(d, b.config);
+    this.log(deviceId, `Configuration restored from "${b.label}" (running only; save to keep it).`, "warn");
+    this.touch();
+    return true;
+  }
+
+  /** Reboot: the running configuration is replaced by whatever was saved. */
+  reboot(deviceId: string, bootMultiplier = 1) {
+    const d = this.devices.get(deviceId);
+    if (!d || !d.power) return;
+    const lost = this.isDirty(d);
+    this.applyConfig(d, d.startup ?? this.factoryConfig(d));
+    d.bootingUntil = this.now() + BOOT_SECONDS[d.kind] * bootMultiplier;
+    d.bootedAt = d.bootingUntil;
+    this.log(deviceId, lost ? "Rebooting. Unsaved running configuration was discarded." : "Rebooting.", lost ? "warn" : "info");
+    this.touch();
+  }
+
+  updateFirmware(deviceId: string): string | null {
+    const d = this.devices.get(deviceId);
+    if (!d) return "Device not found.";
+    const target = FIRMWARE[d.kind].latest;
+    if (d.firmware === target) return "Already on the latest firmware.";
+    if (!d.power) return "Power the device on first.";
+    d.firmware = target;
+    this.log(deviceId, `Firmware updated to ${target}. Rebooting to apply.`);
+    this.reboot(deviceId, 2);
+    return null;
+  }
+
+  uptime(d: Device): string {
+    if (!d.power) return "down";
+    if (this.isBooting(d)) return "booting";
+    const secs = Math.max(0, this.now() - (d.bootedAt ?? 0));
+    if (secs < 60) return `${Math.floor(secs)} s`;
+    if (secs < 3600) return `${Math.floor(secs / 60)} min`;
+    return `${(secs / 3600).toFixed(1)} h`;
   }
 
   // ----------------------------------------------------------- lookups
@@ -252,8 +358,11 @@ export class Network {
     if (!d) return;
     d.power = on;
     if (on) {
+      const lost = this.isDirty(d);
+      this.applyConfig(d, d.startup ?? this.factoryConfig(d));
       d.bootingUntil = this.now() + BOOT_SECONDS[d.kind];
-      this.log(deviceId, `Power on. Booting (${BOOT_SECONDS[d.kind]} s)…`);
+      d.bootedAt = d.bootingUntil;
+      this.log(deviceId, `Power on. Booting (${BOOT_SECONDS[d.kind]} s)…${lost ? " Unsaved running configuration was lost." : ""}`, lost ? "warn" : "info");
     } else {
       d.bootingUntil = undefined;
       this.log(deviceId, "Power off.", "warn");
@@ -352,13 +461,48 @@ export class Network {
     return null;
   }
 
+  /** Speed/duplex negotiation between the two ends of a link. */
+  negotiate(l: Link): { mbit: number; duplex: "full" | "half"; mismatch: boolean } {
+    const a = this.iface(l.a);
+    const b = this.iface(l.b);
+    const max = l.medium === "fiber" ? 10000 : 1000;
+    const sa = a?.speed ?? "auto";
+    const sb = b?.speed ?? "auto";
+    const da = a?.duplex ?? "auto";
+    const db = b?.duplex ?? "auto";
+    let mbit = max;
+    if (sa !== "auto" || sb !== "auto") mbit = Math.min(sa === "auto" ? max : Number(sa), sb === "auto" ? max : Number(sb));
+    // A forced side against an auto side: the auto side cannot negotiate and falls back to half duplex.
+    const forcedA = sa !== "auto" || da !== "auto";
+    const forcedB = sb !== "auto" || db !== "auto";
+    let duplex: "full" | "half" = "full";
+    let mismatch = false;
+    if (da === "half" || db === "half") duplex = "half";
+    if ((forcedA && !forcedB) || (forcedB && !forcedA)) {
+      mismatch = (forcedA ? da : db) !== "half" ? true : false;
+      duplex = "half";
+    }
+    if (da !== "auto" && db !== "auto" && da !== db) mismatch = true;
+    if (sa !== "auto" && sb !== "auto" && sa !== sb) mismatch = true;
+    return { mbit, duplex, mismatch };
+  }
+
   linkSpeed(l: Link): string {
-    return l.latencyMs !== undefined ? "100 Mbit/s uplink" : MEDIA[l.medium].speed;
+    if (l.latencyMs !== undefined) return "100 Mbit/s uplink";
+    const n = this.negotiate(l);
+    return `${n.mbit >= 1000 ? n.mbit / 1000 + " Gbit/s" : n.mbit + " Mbit/s"} ${n.duplex}${n.mismatch ? " (errors)" : ""}`;
   }
 
   linkLatencyMs(l: Link): number {
     if (l.latencyMs !== undefined) return l.latencyMs;
-    return 0.01 + (l.lengthM / 1000) * MEDIA[l.medium].latencyPerKm;
+    const base = 0.01 + (l.lengthM / 1000) * MEDIA[l.medium].latencyPerKm;
+    const n = this.negotiate(l);
+    // A duplex mismatch means collisions and retransmissions: it works, badly.
+    return n.mismatch ? base + 38 : n.duplex === "half" ? base + 2 : base;
+  }
+
+  adminDown(i: Iface): boolean {
+    return i.enabled === false;
   }
 
   /** Is this interface physically connected to anything live? */
@@ -367,6 +511,7 @@ export class Network {
     const l = this.links.get(i.linkId);
     if (!l || this.linkIssue(l)) return "down";
     const peer = this.peerIface(i.id);
+    if (this.adminDown(i) || (peer && this.adminDown(peer))) return "down";
     const dev = this.devices.get(i.deviceId);
     const pdev = peer ? this.devices.get(peer.deviceId) : undefined;
     if (!dev || !pdev || !this.isUp(dev) || !this.isUp(pdev)) return "down";
@@ -377,6 +522,7 @@ export class Network {
   effective(i: Iface): EffectiveAddr | null {
     const dev = this.devices.get(i.deviceId);
     if (!dev || !this.isUp(dev)) return null;
+    if (i.enabled === false) return null;
     if (i.mode === "static") {
       const ip = parseIp(i.ip);
       if (ip === null || !i.prefix) return null;
@@ -446,6 +592,11 @@ export class Network {
       if (issue) {
         if (!physicalOnly) continue;
         result.issues.push(`the cable between ${this.devices.get(cur.iface.deviceId)?.name} ${cur.iface.name} and ${farDev.name} ${far.name} has no link (${issue})`);
+      }
+      if (this.adminDown(cur.iface) || this.adminDown(far)) {
+        if (!physicalOnly) continue;
+        const shut = this.adminDown(cur.iface) ? cur.iface : far;
+        result.issues.push(`port ${shut.name} on ${this.devices.get(shut.deviceId)?.name} is shut down`);
       }
       if (!this.isUp(farDev)) {
         if (!physicalOnly) continue;
@@ -708,8 +859,11 @@ export class Network {
       if (ls === "down") {
         const l = this.links.get(out.linkId!)!;
         const issue = this.linkIssue(l);
-        const peerDev = this.devices.get(this.peerIface(out.id)!.deviceId)!;
+        const peerIf = this.peerIface(out.id)!;
+        const peerDev = this.devices.get(peerIf.deviceId)!;
         if (issue) return fail(`No link on ${cur.name} ${out.name}: ${issue}.`, l.damaged ? "Replace the damaged cable." : "Use fiber for long runs, or put a switch in between to split the distance.");
+        if (this.adminDown(out)) return fail(`${cur.name} ${out.name} is administratively down.`, "Enable the port (no shutdown).");
+        if (this.adminDown(peerIf)) return fail(`${peerDev.name} ${peerIf.name} at the far end is administratively down.`, "Enable that port on the other device.");
         return fail(`The link on ${cur.name} ${out.name} is down: ${peerDev.name} is ${this.isBooting(peerDev) ? "still booting" : "powered off"}.`, this.isBooting(peerDev) ? "Wait a few seconds." : "Power on the device at the other end.");
       }
 
@@ -732,7 +886,7 @@ export class Network {
         let hint: string;
         if (physicallyThere && phys.issues.length) {
           detail = `ARP for ${ipToStr(nextIp)} got no reply: the path is physically broken. ${phys.issues.map((x) => x[0].toUpperCase() + x.slice(1)).join("; ")}.`;
-          hint = phys.issues.some((x) => x.includes("damaged")) ? "Find the red port and replace the cable." : phys.issues.some((x) => x.includes("exceeds")) ? "That run is too long for copper. Use fiber or add a switch halfway." : "Power the device back on, or wait for it to boot.";
+          hint = phys.issues.some((x) => x.includes("damaged")) ? "Find the red port and replace the cable." : phys.issues.some((x) => x.includes("exceeds")) ? "That run is too long for copper. Use fiber or add a switch halfway." : phys.issues.some((x) => x.includes("shut down")) ? "Enable the port again (no shutdown)." : "Power the device back on, or wait for it to boot.";
           return fail(detail, hint);
         }
         if (route.nextHop !== undefined) {
@@ -887,6 +1041,7 @@ export class Network {
   // ----------------------------------------------------------- description helpers
   describeIface(i: Iface): string {
     const e = this.effective(i);
+    if (i.enabled === false) return "administratively down";
     if (i.mode === "none") return "L2 port";
     const dev = this.devices.get(i.deviceId);
     if (dev && this.isBooting(dev)) return "booting…";

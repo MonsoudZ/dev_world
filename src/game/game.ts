@@ -2,7 +2,7 @@
 
 import { Emitter } from "../core/events";
 import { Network, TraceResult } from "../net/sim";
-import { DeviceKind, Device, NetworkSnapshot } from "../net/model";
+import { DeviceKind, Device, NetworkSnapshot, PDU_CAPACITY_W, UPS_CAPACITY_W, UPS_RUNTIME_S, WATTS, isRackKind } from "../net/model";
 import { BUILDINGS, building, roadPath } from "../world/map";
 import { People } from "../world/people";
 import { Vehicles } from "../world/vehicles";
@@ -61,6 +61,8 @@ export class Game {
   net = new Network();
   people: People;
   vehicles: Vehicles;
+  mainsOut = new Map<string, number>(); // buildingId -> game time when power returns
+  breakerTripped = new Set<string>(); // buildings whose rack PDU breaker tripped
   rain = 0; // current rain intensity 0..1
   rainTarget = 0;
   rainUntil = 0; // game time when the rain stops
@@ -104,6 +106,106 @@ export class Game {
     );
   }
 
+  // ------------------------------------------------------------- power
+  upsIn(buildingId: string): Device | undefined {
+    return this.net.devicesIn(buildingId).find((d) => d.kind === "ups" && d.power);
+  }
+
+  /** Watts drawn by rack equipment in a building (what the PDU carries). */
+  pduLoadW(buildingId: string): number {
+    return this.net.devicesIn(buildingId).filter((d) => isRackKind(d.kind) && d.power).reduce((a, d) => a + WATTS[d.kind], 0);
+  }
+
+  upsLoadW(buildingId: string): number {
+    return this.net.devicesIn(buildingId).filter((d) => isRackKind(d.kind) && d.power && d.powerSource === "ups" && d.kind !== "ups").reduce((a, d) => a + WATTS[d.kind], 0);
+  }
+
+  mainsIsOut(buildingId: string): boolean {
+    return this.mainsOut.has(buildingId);
+  }
+
+  cutMains(buildingId: string, seconds: number) {
+    this.mainsOut.set(buildingId, this.time + seconds);
+    const b = building(buildingId);
+    this.toast(`Power cut at ${b.name}.`, "bad");
+    for (const d of this.net.devicesIn(buildingId)) this.net.log(d.id, "Mains power lost.", "warn");
+    this.applyPower();
+  }
+
+  restoreMains(buildingId: string) {
+    if (!this.mainsOut.delete(buildingId)) return;
+    this.toast(`Power is back at ${building(buildingId).name}.`, "good");
+    this.applyPower();
+  }
+
+  resetBreaker(buildingId: string) {
+    this.breakerTripped.delete(buildingId);
+    this.applyPower();
+  }
+
+  /** Decide which devices have power right now; called when anything power-related changes. */
+  applyPower() {
+    let changed = false;
+    for (const b of BUILDINGS) {
+      const devs = this.net.devicesIn(b.id);
+      const out = this.mainsOut.has(b.id);
+      const ups = devs.find((d) => d.kind === "ups");
+      const upsAlive = !!ups && ups.power && (ups.battery ?? 0) > 0;
+      // breaker: too much on the PDU
+      if (!this.breakerTripped.has(b.id) && this.pduLoadW(b.id) > PDU_CAPACITY_W) {
+        this.breakerTripped.add(b.id);
+        this.toast(`${b.name}: rack PDU overloaded (${this.pduLoadW(b.id)} W > ${PDU_CAPACITY_W} W). Breaker tripped.`, "bad");
+        for (const d of devs) if (isRackKind(d.kind)) this.net.log(d.id, "PDU breaker tripped: rack lost power.", "error");
+      }
+      const tripped = this.breakerTripped.has(b.id);
+      for (const d of devs) {
+        const rack = isRackKind(d.kind);
+        const hasPower = rack ? !tripped && (!out || (d.powerSource === "ups" && upsAlive) || d.kind === "ups") && !(d.kind === "ups" && out && (ups?.battery ?? 0) <= 0) : !out;
+        if (d.power && !hasPower) {
+          d.outageOff = true;
+          this.net.setPower(d.id, false);
+          changed = true;
+        } else if (!d.power && hasPower && d.outageOff) {
+          d.outageOff = false;
+          this.net.setPower(d.id, true);
+          changed = true;
+        }
+      }
+    }
+    if (changed) {
+      this.recompute();
+      this.events.emit("change", undefined);
+    }
+  }
+
+  private tickPower(dt: number) {
+    let dirty = false;
+    for (const [bid, until] of [...this.mainsOut.entries()]) {
+      if (this.time >= until) {
+        this.restoreMains(bid);
+        continue;
+      }
+      const ups = this.upsIn(bid);
+      if (ups && (ups.battery ?? 0) > 0) {
+        const load = this.upsLoadW(bid);
+        const drain = (load / UPS_CAPACITY_W) * (dt / UPS_RUNTIME_S) + dt / (UPS_RUNTIME_S * 12);
+        ups.battery = Math.max(0, (ups.battery ?? 1) - drain);
+        if (ups.battery === 0) {
+          this.net.log(ups.id, "Battery exhausted. Load dropped.", "error");
+          this.toast(`${building(bid).name}: the UPS battery is flat.`, "bad");
+          dirty = true;
+        }
+      }
+    }
+    // recharge when mains is on
+    for (const b of BUILDINGS) {
+      if (this.mainsOut.has(b.id)) continue;
+      const ups = this.upsIn(b.id);
+      if (ups && (ups.battery ?? 1) < 1) ups.battery = Math.min(1, (ups.battery ?? 1) + dt / (UPS_RUNTIME_S * 3));
+    }
+    if (dirty) this.applyPower();
+  }
+
   /** Start rain that fades out after `seconds`. */
   setRain(intensity: number, seconds = 90) {
     this.rainTarget = intensity;
@@ -116,7 +218,7 @@ export class Game {
     this.attachClock();
     seedWorld(this.net);
     this.progress = { lesson: 0, step: 0, completed: [], quizRight: 0, quizWrong: 0, finished: false };
-    this.unlockedDevices = new Set(this.mode === "sandbox" ? ["pc", "laptop", "switch", "router", "server"] : ["switch"]);
+    this.unlockedDevices = new Set(this.mode === "sandbox" ? ["pc", "laptop", "switch", "router", "server", "ups"] : ["switch"]);
     this.unlockedBuildings = new Set(BUILDINGS.filter((b) => !b.locked || this.mode === "sandbox").map((b) => b.id));
     this.dayFrac = 0.32;
     this.day = 1;
@@ -216,6 +318,7 @@ export class Game {
     this.vehicles.update(dt);
     if (this.rainUntil && this.time > this.rainUntil) this.rainTarget = 0;
     this.rain += (this.rainTarget - this.rain) * Math.min(1, dt * 0.4);
+    this.tickPower(dt);
     if (this.net.tickBoots()) {
       this.recompute();
       this.events.emit("change", undefined);
@@ -551,7 +654,7 @@ export class Game {
     if (!raw) return false;
     const data = JSON.parse(raw) as SaveFile;
     data.mode = "sandbox";
-    data.unlockedDevices = ["pc", "laptop", "switch", "router", "server"];
+    data.unlockedDevices = ["pc", "laptop", "switch", "router", "server", "ups"];
     data.unlockedBuildings = BUILDINGS.map((b) => b.id);
     localStorage.setItem("dev-world:sandbox", JSON.stringify(data));
     return true;

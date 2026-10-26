@@ -68,6 +68,8 @@ export function seedWorld(net: Network) {
   clinicSrv.services.http = { enabled: true, hostnames: ["records.clinic"], title: "Hollow Clinic patient records (confidential)" };
   clinicSrv.note = "Holds patient records. Must never be reachable from outside the clinic.";
   net.touch();
+  // Everything the town already owns was set up and saved by whoever installed it.
+  for (const d of net.devices.values()) d.startup = net.extractConfig(d);
 }
 
 // ----------------------------------------------------------------- helpers
@@ -99,6 +101,11 @@ function devicesLinked(g: Game, aId: string, bId: string): boolean {
 
 function routerIn(g: Game, buildingId: string) {
   return g.net.devicesIn(buildingId).find((d) => d.kind === "router");
+}
+
+/** Device by id, or the workshop router when the id is the campaign's router placeholder. */
+function routerInId(g: Game, id: string) {
+  return id === "rtr" ? routerIn(g, "workshop") : g.net.device(id);
 }
 
 function reachesRouterLan(g: Game, deviceId: string): boolean {
@@ -527,6 +534,53 @@ export const LESSONS: Lesson[] = [
       task("Find the break", "From Reading-Room-1 run: trace learn.example. Follow the hops, find the damaged cable (a red port, a red dashed line on the map) and replace it. The event log on Library-SW also records the moment the link went down.", (g) => ![...g.net.links.values()].some((l) => l.damaged) && fetchOk(g, "lib_laptop1", "http://learn.example"), "In the workspace, a damaged port shows red. Press Replace cable on it.", "library"),
       info("Bottom-up", "When something breaks, test the layers in order: physical (link up?), addressing (does the host have an address? any conflicts?), routing (can it reach the gateway?), names (does DNS answer?), service (is the server listening?). The trace tool shows which layer failed."),
       quiz("A user says 'the website is down'. What do you check first?", ["Reinstall the browser", "Link lights, then whether the host can ping its gateway", "Rewrite the DNS records", "Buy a new server"], 1, "Start at the bottom. Most outages are a cable, a power switch or an address, and those are also the quickest to confirm or rule out."),
+    ],
+  },
+  {
+    id: "ops",
+    title: "Keep it running",
+    concept: "Running vs saved configuration, backups, power",
+    note: "Changes live in the running configuration until you save them (write). A reboot or power cut loads the saved startup configuration, so unsaved work vanishes. Take a backup before risky changes and restore from it if they go wrong. A UPS keeps rack gear alive through a mains cut; rack power has a limit, and an overloaded PDU trips its breaker.",
+    steps: [
+      talk("Rosa", "Storm season is not over. Before the next one, I want you to understand something every network engineer learns the hard way: what survives a reboot and what does not.", "workshop"),
+      info(
+        "Running versus saved",
+        "Every change you make lives in the device's running configuration and works immediately. The device also keeps a saved startup configuration, which is what it loads when it reboots or loses power. If the two differ, a reboot throws your work away. On the rack, an amber dot on a faceplate and an 'unsaved' badge mean exactly that."
+      ),
+      task("Read the router's running configuration", "Open the workshop router's terminal and run: show running-config. Then compare with show startup-config.", (g) => {
+        const r = routerIn(g, "workshop");
+        return !!r && hasFlag(g, `showrun:${r.id}`);
+      }, "The router is in the workshop rack. Its console is on the right.", "workshop"),
+      predict("The router was added by you and never saved. If it rebooted right now, what would happen to the town's internet?", ["Nothing, settings are stored in hardware", "It comes back with factory defaults: no LAN address, no NAT, no DHCP, the town goes dark", "Only the DHCP leases are lost"], "Let's not test that on the live router. Save first, then we will prove it on something harmless."),
+      task("Save the router and the switches", "Press Save config (or type write) on the workshop router, Workshop-SW and Library-SW, and on anything else showing 'unsaved'.", (g) => {
+        const r = routerIn(g, "workshop");
+        return !!r && !g.net.isDirty(r) && !g.net.isDirty(g.net.device("ws_switch")!) && !g.net.isDirty(g.net.device("lib_switch")!);
+      }, "Devices with a yellow badge in the rack list still need saving.", "workshop", (g) => ["rtr", "ws_switch", "lib_switch"].map((id) => {
+        const d = routerInId(g, id);
+        return { label: d ? `${d.name} saved` : "router saved", done: !!d && !g.net.isDirty(d) };
+      })),
+      task("Take a backup", "Run backup on the workshop router (or press Backup now). Backups are copies you can restore from later.", (g) => {
+        const r = routerIn(g, "workshop");
+        return !!r && (r.backups?.length ?? 0) > 0;
+      }, undefined, "workshop"),
+      task("Prove it on the laptop", "On Rosa-Laptop, change something without saving (for example set description on eth0 from the port settings, or type: interface eth0 description test). Then reload it and watch the change disappear from show running-config.", (g) => hasFlag(g, "reload:ws_laptop"), "Terminal on Rosa-Laptop: interface eth0 description test, then reload.", "workshop"),
+      info("Ports are managed too", "Every port can be shut down, forced to a speed and duplex, and labelled. Shutting a port is how you take a cable out of service without touching it. Forcing speed or duplex on one end only causes a mismatch: the link stays up but drops into collisions and crawls. Leave ports on auto unless both ends agree."),
+      { kind: "unlock", devices: ["ups"] },
+      task("Add a UPS to the workshop rack", "Add equipment → UPS. Then on the router, Workshop-SW and ISP-Modem set Powered from: UPS outlet. The UPS takes 600 W; check the power card for the load.", (g) => {
+        const ups = g.net.devicesIn("workshop").find((d) => d.kind === "ups");
+        const r = routerIn(g, "workshop");
+        return !!ups && !!r && r.powerSource === "ups" && g.net.device("ws_switch")!.powerSource === "ups" && g.net.device("ws_modem")!.powerSource === "ups";
+      }, "The Powered from selector is in each device's Configuration & power card.", "workshop", (g) => [
+        { label: "UPS installed in the workshop", done: !!g.net.devicesIn("workshop").find((d) => d.kind === "ups") },
+        { label: "Router on the UPS", done: routerIn(g, "workshop")?.powerSource === "ups" },
+        { label: "Workshop-SW on the UPS", done: g.net.device("ws_switch")!.powerSource === "ups" },
+        { label: "ISP-Modem on the UPS", done: g.net.device("ws_modem")!.powerSource === "ups" },
+      ]),
+      talk("Rosa", "Now we test it for real. I'm pulling the main breaker on the workshop for a minute. Watch the library."),
+      { kind: "event", run: (g) => g.cutMains("workshop", 75) },
+      task("Ride out the outage", "The workshop is on battery. The library should stay online the whole time. Wait for mains to come back.", (g) => !g.mainsIsOut("workshop") && !!g.needStatus.get("library_classes")?.ok, "If the library dropped, something in the path is not on the UPS. Check the power card.", "library"),
+      quiz("After the power came back, why did the router still have its LAN address, NAT and DHCP?", ["Routers never lose settings", "Because the running configuration had been saved to startup-config before the reboot", "Because the UPS stored the configuration", "Because DHCP clients remembered it"], 1, "The UPS kept the lights on this time, but it is the saved startup configuration that makes a device come back the same after any reboot."),
+      info("Habits", "Save after every change you want to keep. Back up before anything risky, restore if it goes wrong. Put the things the whole town depends on (modem, router, core switch) on battery. Watch the PDU load: a rack has a power budget too, and an overload trips the breaker."),
     ],
   },
   {

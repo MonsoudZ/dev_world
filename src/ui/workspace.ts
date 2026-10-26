@@ -2,11 +2,11 @@
 
 import { el } from "../core/events";
 import { Game } from "../game/game";
-import { CATALOG, Device, DeviceKind, Iface, MEDIA, Medium } from "../net/model";
+import { CATALOG, Device, DeviceKind, FIRMWARE, Iface, MEDIA, Medium, PDU_CAPACITY_W, UPS_CAPACITY_W, isRackKind } from "../net/model";
 import { ipToStr, parseIp } from "../net/ip";
 import { TraceResult } from "../net/sim";
 import { building, cableLengthM } from "../world/map";
-import { Terminal } from "./terminal";
+import { Terminal, formatConfig } from "./terminal";
 import { RoomView } from "./room";
 
 export class Workspace {
@@ -18,6 +18,8 @@ export class Workspace {
   private showAllLogs = false;
   private room: RoomView;
   private roomCollapsed = false;
+  private portEditing: string | null = null;
+  private showConfig = false;
 
   constructor(private game: Game, private host: HTMLElement) {
     this.root = el("div", { class: "ws-overlay hidden" });
@@ -134,7 +136,7 @@ export class Workspace {
   private renderRack(devices: Device[], sel: Device | null, slots: number) {
     const g = this.game;
     const bid = this.buildingId!;
-    const kinds: DeviceKind[] = (["pc", "laptop", "switch", "router", "server"] as DeviceKind[]).filter((k) => g.unlockedDevices.has(k));
+    const kinds: DeviceKind[] = (["pc", "laptop", "switch", "router", "server", "ups"] as DeviceKind[]).filter((k) => g.unlockedDevices.has(k));
     const addSel = el("select", { class: "sel" }, el("option", { value: "" }, "+ Add equipment…"), ...kinds.map((k) => el("option", { value: k }, `${CATALOG[k].icon} ${CATALOG[k].label}`)));
     addSel.onchange = () => {
       const k = addSel.value as DeviceKind;
@@ -179,14 +181,43 @@ export class Workspace {
           el(
             "span",
             { class: "rack-text" },
-            el("strong", {}, d.name),
-            el("span", { class: "muted small" }, CATALOG[d.kind].label + (booting ? " · booting…" : addr ? ` · ${ipToStr(addr.ip)}` : CATALOG[d.kind].l3 && d.power ? " · no address" : ""))
+            el("strong", {}, d.name, d.power && g.net.isDirty(d) ? el("span", { class: "badge warn", title: "Running configuration not saved" }, "unsaved") : null),
+            el("span", { class: "muted small" }, CATALOG[d.kind].label + (booting ? " · booting…" : d.kind === "ups" ? ` · battery ${Math.round((d.battery ?? 1) * 100)}%` : addr ? ` · ${ipToStr(addr.ip)}` : CATALOG[d.kind].l3 && d.power ? " · no address" : ""))
           ),
           el("span", { class: `led ${!d.power ? "off" : booting ? "amber" : conflict ? "red" : up ? "green" : "grey"}`, title: !d.power ? "powered off" : booting ? "booting" : conflict ? "address conflict" : up ? "link up" : "no link" })
         );
       }),
       addSel,
+      this.renderPower(bid),
       el("p", { class: "muted small rack-help" }, "Select a device to see its ports, settings and terminal.")
+    );
+  }
+
+  private renderPower(bid: string) {
+    const g = this.game;
+    const out = g.mainsIsOut(bid);
+    const tripped = g.breakerTripped.has(bid);
+    const load = g.pduLoadW(bid);
+    const ups = g.net.devicesIn(bid).find((d) => d.kind === "ups");
+    const pct = Math.min(100, Math.round((load / PDU_CAPACITY_W) * 100));
+    return el(
+      "div",
+      { class: "power-card" },
+      el("div", { class: "row between" }, el("strong", {}, "Power"), el("span", { class: `badge ${out ? "bad" : "ok"}` }, out ? "mains out" : "mains ok")),
+      el("div", { class: "row between small" }, el("span", {}, `Rack PDU ${load} / ${PDU_CAPACITY_W} W`), tripped ? el("span", { class: "bad" }, "breaker tripped") : null),
+      el("div", { class: `meter ${pct > 100 ? "bad" : pct > 80 ? "warn" : ""}` }, el("span", { style: `width:${pct}%` })),
+      tripped ? el("button", { class: "btn small good", onclick: () => { g.resetBreaker(bid); this.render(); } }, "Reset breaker") : null,
+      ups
+        ? el(
+            "div",
+            {},
+            el("div", { class: "row between small" }, el("span", {}, `UPS ${ups.name}: ${g.upsLoadW(bid)} / ${UPS_CAPACITY_W} W`), el("span", { class: (ups.battery ?? 1) < 0.3 ? "bad" : "good" }, `${Math.round((ups.battery ?? 1) * 100)}%${out ? " · on battery" : ""}`)),
+            el("div", { class: `meter ${(ups.battery ?? 1) < 0.3 ? "bad" : ""}` }, el("span", { style: `width:${Math.round((ups.battery ?? 1) * 100)}%` }))
+          )
+        : el("div", { class: "muted small" }, "No UPS: a mains cut takes the whole rack down and unsaved configs with it."),
+      g.mode === "sandbox"
+        ? el("button", { class: "btn small ghost", onclick: () => { if (out) g.restoreMains(bid); else g.cutMains(bid, 90); this.render(); } }, out ? "Restore mains" : "⚡ Cut mains (90 s)")
+        : null
     );
   }
 
@@ -226,6 +257,15 @@ export class Workspace {
         })(),
         el("span", {}, "Power")
       ),
+      d.kind !== "cloud"
+        ? el(
+            "div",
+            { class: "row wrap" },
+            el("button", { class: `btn small ${g.net.isDirty(d) ? "primary" : "ghost"}`, title: "Copy the running configuration to startup-config (write)", onclick: () => { g.net.saveConfig(d.id); g.flags.add(`write:${d.id}`); g.save(); g.toast(`${d.name}: configuration saved.`, "good"); this.render(); } }, g.net.isDirty(d) ? "Save config ●" : "Config saved"),
+            el("button", { class: "btn small ghost", title: "Reboot (unsaved changes are lost)", onclick: () => { if (g.net.isDirty(d) && !confirm(`${d.name} has unsaved changes that will be lost. Reboot anyway?`)) return; g.net.reboot(d.id); g.flags.add(`reload:${d.id}`); g.recompute(); g.save(); this.render(); } }, "Reboot"),
+            d.firmware !== FIRMWARE[d.kind].latest ? el("button", { class: "btn small", title: `Update firmware ${d.firmware} → ${FIRMWARE[d.kind].latest} (reboots)`, onclick: () => { const r = g.net.updateFirmware(d.id); if (r) g.toast(r, "bad"); else { g.flags.add(`firmware:${d.id}`); g.toast(`${d.name}: updating firmware, rebooting.`, "info"); } g.recompute(); g.save(); this.render(); } }, `Update firmware (${FIRMWARE[d.kind].latest})`) : el("span", { class: "muted small" }, `fw ${d.firmware} · up ${g.net.uptime(d)}`)
+          )
+        : null,
       d.fixed
         ? null
         : el(
@@ -249,6 +289,7 @@ export class Workspace {
     if (cat.l3) for (const i of d.ifaces) sections.push(this.renderIfaceConfig(d, i));
     if (d.kind === "router") sections.push(this.renderRoutes(d), this.renderAcl(d));
     if (d.kind === "server") sections.push(this.renderServices(d));
+    if (d.kind !== "cloud") sections.push(this.renderConfigCard(d));
     sections.push(this.renderLog(d));
     return el("section", { class: "ws-detail" }, ...sections);
   }
@@ -271,11 +312,19 @@ export class Workspace {
           const issue = link ? g.net.linkIssue(link) : null;
           const media = link && !peerDev?.hidden ? ` · ${link.medium} ${link.lengthM} m` : "";
           const farOff = peerDev && !g.net.isUp(peerDev) ? (g.net.isBooting(peerDev) ? " · far end booting" : " · far end is off") : "";
+          const adminDown = i.enabled === false;
+          const speed = link && st === "up" ? ` · ${g.net.linkSpeed(link)}` : "";
+          const editing = this.portEditing === i.id;
+          const editRow = editing ? this.renderPortConfig(d, i) : null;
           return el(
             "div",
-            { class: `port ${st}` },
-            el("span", { class: `led ${st === "up" ? "green" : st === "down" ? "red" : "grey"}` }),
-            el("div", { class: "grow" }, el("strong", {}, i.name, el("span", { class: "mac" }, i.mac)), el("div", { class: "muted small" }, peerDev ? `→ ${peerDev.name} ${peer!.name}${remote}${media}${issue ? ` · NO LINK: ${issue}` : farOff}` : "empty")),
+            { class: "port-wrap" },
+            el(
+              "div",
+              { class: `port ${st}` },
+              el("span", { class: `led ${adminDown ? "amber" : st === "up" ? "green" : st === "down" ? "red" : "grey"}` }),
+              el("div", { class: "grow" }, el("strong", {}, i.name, i.description ? el("span", { class: "muted small" }, ` “${i.description}”`) : null, el("span", { class: "mac" }, i.mac)), el("div", { class: "muted small" }, adminDown ? "administratively down (shutdown)" : peerDev ? `→ ${peerDev.name} ${peer!.name}${remote}${media}${speed}${issue ? ` · NO LINK: ${issue}` : farOff}` : "empty")),
+              i.locked ? null : el("button", { class: "btn tiny ghost", title: "Port settings", onclick: () => { this.portEditing = editing ? null : i.id; this.render(); } }, editing ? "✕" : "⚙"),
             !i.linkId
               ? el("button", { class: "btn small", onclick: () => this.startConnect(i) }, "Connect")
               : el(
@@ -327,8 +376,50 @@ export class Workspace {
                         "Unplug"
                       )
                 )
+            ),
+            editRow
           );
         })
+      )
+    );
+  }
+
+  private renderPortConfig(d: Device, i: Iface) {
+    const g = this.game;
+    const en = el("input", { type: "checkbox" }) as HTMLInputElement;
+    en.checked = i.enabled !== false;
+    const speed = el("select", { class: "sel" }, ...["auto", "100", "1000"].map((v) => el("option", { value: v }, v === "auto" ? "Speed: auto" : `Speed: ${v} Mbit/s`))) as HTMLSelectElement;
+    speed.value = i.speed ?? "auto";
+    const duplex = el("select", { class: "sel" }, ...["auto", "full", "half"].map((v) => el("option", { value: v }, `Duplex: ${v}`))) as HTMLSelectElement;
+    duplex.value = i.duplex ?? "auto";
+    const desc = el("input", { class: "inp", placeholder: "description (e.g. uplink to library)", value: i.description ?? "" }) as HTMLInputElement;
+    return el(
+      "div",
+      { class: "port-config" },
+      el("label", { class: "toggle" }, en, el("span", {}, "Enabled")),
+      speed,
+      duplex,
+      desc,
+      el(
+        "button",
+        {
+          class: "btn small",
+          onclick: () => {
+            i.enabled = en.checked ? undefined : false;
+            i.speed = speed.value as "auto";
+            i.duplex = duplex.value as "auto";
+            i.description = desc.value.trim() || undefined;
+            g.net.log(d.id, `${i.name}: ${en.checked ? "no shutdown" : "shutdown"}, speed ${speed.value}, duplex ${duplex.value}`);
+            g.net.touch();
+            g.recompute();
+            g.save();
+            const link = g.net.linkOf(i.id);
+            if (link && g.net.negotiate(link).mismatch) g.toast(`${d.name} ${i.name}: duplex mismatch with the far end. The link is up but will crawl.`, "bad");
+            this.portEditing = null;
+            this.render();
+          },
+        },
+        "Apply"
       )
     );
   }
@@ -458,6 +549,49 @@ export class Workspace {
         ...options,
         el("button", { class: "btn ghost", onclick: () => { this.mediumChoice = null; g.pendingCable = undefined; this.render(); } }, "Cancel")
       )
+    );
+  }
+
+  private renderConfigCard(d: Device) {
+    const g = this.game;
+    const dirty = g.net.isDirty(d);
+    const backups = d.backups ?? [];
+    const src = isRackKind(d.kind) && d.kind !== "ups"
+      ? (() => {
+          const sel = el("select", { class: "sel" }, el("option", { value: "pdu" }, "Rack PDU (mains)"), el("option", { value: "ups" }, "UPS outlet (battery backed)")) as HTMLSelectElement;
+          sel.value = d.powerSource ?? "pdu";
+          sel.onchange = () => {
+            d.powerSource = sel.value as "pdu" | "ups";
+            g.net.log(d.id, `Power lead moved to the ${sel.value === "ups" ? "UPS" : "PDU"}.`);
+            g.applyPower();
+            g.save();
+            this.render();
+          };
+          return el("label", {}, "Powered from", sel);
+        })()
+      : null;
+    return el(
+      "div",
+      { class: "card" },
+      el("div", { class: "row between" }, el("h4", {}, "Configuration & power"), el("span", { class: `badge ${dirty ? "warn" : "ok"}` }, dirty ? "running ≠ startup" : "saved")),
+      el("p", { class: "muted small" }, "Changes take effect immediately but live only in the running configuration. A reboot or a power cut loads the saved startup configuration; press Save config (or type write) to keep your work."),
+      el(
+        "div",
+        { class: "row wrap" },
+        el("button", { class: "btn small", onclick: () => { g.net.backup(d.id); g.flags.add(`backup:${d.id}`); g.save(); this.render(); } }, "Backup now"),
+        el("button", { class: "btn small ghost", onclick: () => { this.showConfig = !this.showConfig; this.render(); } }, this.showConfig ? "Hide running-config" : "Show running-config"),
+        src
+      ),
+      this.showConfig ? el("pre", { class: "config-text" }, formatConfig(g.net.extractConfig(d), d.kind)) : null,
+      backups.length
+        ? el(
+            "ul",
+            { class: "list small" },
+            ...backups.map((b, i) =>
+              el("li", {}, `${b.label} · ${b.t} `, el("button", { class: "btn tiny ghost", onclick: () => { g.net.restore(d.id, i); g.recompute(); g.save(); g.toast(`${d.name}: restored "${b.label}" into the running configuration. Save it to keep it.`, "info"); this.render(); } }, "restore"))
+            )
+          )
+        : el("p", { class: "muted small" }, "No backups yet. Take one before a risky change.")
     );
   }
 

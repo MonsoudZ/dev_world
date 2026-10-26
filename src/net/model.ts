@@ -1,6 +1,9 @@
 // Data model for the network simulation. Everything here is plain JSON-serialisable.
 
-export type DeviceKind = "pc" | "laptop" | "switch" | "router" | "server" | "modem" | "cloud";
+export type DeviceKind = "pc" | "laptop" | "switch" | "router" | "server" | "modem" | "cloud" | "ups";
+
+export type PortSpeed = "auto" | "100" | "1000";
+export type PortDuplex = "auto" | "full" | "half";
 
 export type IfaceMode = "none" | "static" | "dhcp";
 
@@ -36,6 +39,25 @@ export interface Iface {
   linkId?: string;
   lease?: Lease;
   locked?: boolean; // config cannot be edited (ISP side)
+  enabled?: boolean; // undefined = enabled; false = administratively down
+  speed?: PortSpeed; // forced speed, or auto-negotiate
+  duplex?: PortDuplex;
+  description?: string;
+}
+
+/** The configurable part of a device: what `show running-config` prints and what gets saved. */
+export interface DeviceConfig {
+  name: string;
+  ifaces: Record<string, Pick<Iface, "mode" | "ip" | "prefix" | "gateway" | "dns" | "nat" | "dhcp" | "enabled" | "speed" | "duplex" | "description">>;
+  routes: StaticRoute[];
+  acl: AclRule[];
+  services: Services;
+}
+
+export interface ConfigBackup {
+  t: string;
+  label: string;
+  config: DeviceConfig;
 }
 
 export interface StaticRoute {
@@ -80,8 +102,42 @@ export interface Device {
   fixed?: boolean; // cannot be removed
   note?: string;
   bootingUntil?: number; // game time when the device finishes booting
+  bootedAt?: number; // game time of the last boot (for uptime)
   log?: LogEntry[];
+  firmware?: string;
+  startup?: DeviceConfig; // saved configuration; what survives a reboot
+  backups?: ConfigBackup[];
+  powerSource?: "pdu" | "ups"; // rack gear: which outlet strip it hangs off
+  outageOff?: boolean; // powered off by a mains outage; comes back when mains returns
+  battery?: number; // UPS only: 0..1
 }
+
+export const FIRMWARE: Record<DeviceKind, { initial: string; latest: string }> = {
+  pc: { initial: "os 12.4", latest: "os 12.6" },
+  laptop: { initial: "os 12.4", latest: "os 12.6" },
+  switch: { initial: "1.9.2", latest: "2.1.0" },
+  router: { initial: "3.4.1", latest: "3.6.0" },
+  server: { initial: "srv 8.1", latest: "srv 8.3" },
+  modem: { initial: "isp-2.0", latest: "isp-2.0" },
+  cloud: { initial: "-", latest: "-" },
+  ups: { initial: "1.0", latest: "1.0" },
+};
+
+/** Typical power draw in watts. */
+export const WATTS: Record<DeviceKind, number> = {
+  pc: 120,
+  laptop: 45,
+  switch: 18,
+  router: 22,
+  server: 260,
+  modem: 10,
+  cloud: 0,
+  ups: 5,
+};
+
+export const PDU_CAPACITY_W = 1200;
+export const UPS_CAPACITY_W = 600;
+export const UPS_RUNTIME_S = 240; // full battery at full load, in game seconds
 
 export type Medium = "copper" | "fiber";
 
@@ -185,6 +241,15 @@ export const CATALOG: Record<DeviceKind, CatalogEntry> = {
     description: "Everything beyond the provider.",
     icon: "☁️",
   },
+  ups: {
+    label: "UPS (rack, 600 W)",
+    short: "UPS",
+    ports: [],
+    l3: false,
+    routes: false,
+    description: "Battery backup. Rack equipment plugged into it keeps running through a mains outage until the battery is flat.",
+    icon: "🔋",
+  },
 };
 
 export function createDevice(kind: DeviceKind, id: string, name: string, buildingId: string): Device {
@@ -211,7 +276,14 @@ export function createDevice(kind: DeviceKind, id: string, name: string, buildin
     dev.services.http = { enabled: false, hostnames: [], title: "" };
     dev.services.dns = { enabled: false, records: [], forwarder: "" };
   }
+  dev.firmware = FIRMWARE[kind].initial;
+  if (["switch", "router", "server", "modem", "ups"].includes(kind)) dev.powerSource = "pdu";
+  if (kind === "ups") dev.battery = 1;
   return dev;
+}
+
+export function isRackKind(kind: DeviceKind): boolean {
+  return ["switch", "router", "server", "modem", "ups"].includes(kind);
 }
 
 export function isRouterKind(kind: DeviceKind): boolean {

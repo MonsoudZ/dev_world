@@ -50,7 +50,7 @@ export class RoomView {
     root.append(this.defs(b));
     root.append(this.backdrop(b, light));
 
-    const rackDevices = devices.filter((d) => ["switch", "router", "modem", "server"].includes(d.kind)).sort((a, c) => rackOrder(a) - rackOrder(c));
+    const rackDevices = devices.filter((d) => ["switch", "router", "modem", "server", "ups"].includes(d.kind)).sort((a, c) => rackOrder(a) - rackOrder(c));
     const hosts = devices.filter((d) => !rackDevices.includes(d));
     const ports = new Map<string, PortPos>();
 
@@ -219,6 +219,10 @@ export class RoomView {
       if (d.kind === "server" || d.kind === "switch") unit.append(svg("text", { x: w - 22, y: 10, "text-anchor": "end", class: "faceplate-model" }, model(d)));
       // power LED
       unit.append(this.led(w - 10, h - 7, d.power ? (g.net.isBooting(d) ? "amber" : "green") : "off", g.net.isBooting(d)));
+      if (d.power && g.net.isDirty(d)) {
+        unit.append(svg("circle", { cx: w - 22, cy: 7, r: 3, fill: "#ffcc33", filter: "url(#glow)" }));
+        unit.append(svg("title", {}, "Unsaved configuration: a reboot or power cut will discard it."));
+      }
       if (d.kind === "switch") {
         d.ifaces.forEach((p, i) => {
           const px = 8 + i * 18;
@@ -251,6 +255,10 @@ export class RoomView {
         // fiber input (provider side)
         unit.append(svg("rect", { x: w - 30, y: h - 13, width: 14, height: 10, rx: 2, fill: "#ff9800", stroke: "#8a4b00" }));
         unit.append(svg("text", { x: w - 23, y: h - 15, "text-anchor": "middle", class: "port-label dark" }, "FIBER"));
+      } else if (d.kind === "ups") {
+        const bat = d.battery ?? 1;
+        for (let i = 0; i < 5; i++) unit.append(svg("rect", { x: 70 + i * 14, y: 6, width: 10, height: h - 12, rx: 1, fill: bat > (i + 0.5) / 5 ? (bat < 0.3 ? "#ff5252" : "#3ce6aa") : "#2a2f38", filter: bat > (i + 0.5) / 5 ? "url(#glow)" : undefined }));
+        unit.append(svg("text", { x: 150, y: h - 6, class: "port-label" }, `${Math.round(bat * 100)}%  ${g.mainsIsOut(d.buildingId) ? "ON BATTERY" : "ONLINE"}`));
       } else if (d.kind === "server") {
         for (let i = 0; i < 4; i++) {
           unit.append(svg("rect", { x: 8 + i * 30, y: 18, width: 26, height: 12, rx: 1, fill: "#0e1116", stroke: "#3a414d" }));
@@ -362,12 +370,12 @@ export class RoomView {
     const g = this.game;
     const st = g.net.linkState(p);
     const link = g.net.linkOf(p.id);
-    const gEl = svg("g", { class: `port ${st} ${hover ? "hover" : ""}`, "data-port": p.id, transform: `translate(${x} ${y})` });
+    const gEl = svg("g", { class: `port ${st} ${hover ? "hover" : ""} ${p.enabled === false ? "admin-down" : ""}`, "data-port": p.id, transform: `translate(${x} ${y})` });
     gEl.append(svg("title", {}, `${p.name}${link ? ` → ${g.net.device(g.net.peerIface(p.id)!.deviceId)?.name} ${g.net.peerIface(p.id)!.name}` : " (empty: click to connect)"}`));
     gEl.append(svg("rect", { x: 0, y: 0, width: 12, height: 10, rx: 1.5, fill: color ?? (st === "none" ? "#0b0d10" : "#1a1f27"), stroke: hover ? "#5ac8ff" : "#4a5260", "stroke-width": hover ? 1.5 : 0.8 }));
     gEl.append(svg("rect", { x: 3, y: 0, width: 6, height: 3, fill: "#2b313b" }));
     // link LED above
-    const led = st === "up" ? "green" : st === "down" ? "red" : "off";
+    const led = p.enabled === false ? "amber" : st === "up" ? "green" : st === "down" ? "red" : "off";
     gEl.append(this.led(6, -4, led, st === "up"));
     gEl.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -458,7 +466,7 @@ export class RoomView {
 }
 
 function rackOrder(d: Device): number {
-  return { modem: 0, router: 1, switch: 2, server: 3 }[d.kind as "modem" | "router" | "switch" | "server"] ?? 9;
+  return { modem: 0, router: 1, switch: 2, server: 3, ups: 4 }[d.kind as "modem" | "router" | "switch" | "server" | "ups"] ?? 9;
 }
 
 function model(d: Device): string {
@@ -471,6 +479,8 @@ function model(d: Device): string {
       return "PROVIDER ONT";
     case "server":
       return "HOLLOW SRV-2U";
+    case "ups":
+      return "HOLLOW UPS-600";
     default:
       return "";
   }
