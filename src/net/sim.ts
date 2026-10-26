@@ -1,25 +1,10 @@
-// The network simulation. Small but faithful: L2 segments through switches, IP routing,
-// DHCP, NAT, firewall rules, DNS and HTTP. Every operation returns a hop-by-hop trace with
-// plain-language explanations so failures teach instead of just failing.
+// The network simulation. Small but faithful: L2 segments through switches with MAC learning,
+// ARP, IP routing, DHCP, NAT, firewall rules, DNS and HTTP, link media with length limits and
+// latency, device boot time and per-device event logs. Every operation returns a hop-by-hop
+// trace with plain-language explanations so failures teach instead of just failing.
 
-import {
-  Device,
-  DeviceKind,
-  Iface,
-  Link,
-  NetworkSnapshot,
-  Proto,
-  createDevice,
-  isRouterKind,
-} from "./model";
-import {
-  inCidr,
-  ipToStr,
-  isValidHostAddress,
-  parseIp,
-  sameSubnet,
-  isPrivate,
-} from "./ip";
+import { Device, DeviceKind, Iface, Lease, Link, LogEntry, MEDIA, Medium, NetworkSnapshot, Proto, createDevice, isRouterKind } from "./model";
+import { inCidr, ipToStr, isValidHostAddress, parseIp, sameSubnet, isPrivate } from "./ip";
 
 export interface EffectiveAddr {
   ip: number;
@@ -38,6 +23,8 @@ export interface Hop {
   ok: boolean;
   via: string[]; // switch device ids traversed on the way to the next hop
   linkIds: string[]; // links traversed to reach next device (for animation)
+  arp?: { ip: string; mac: string; device: string }; // the L2 resolution done for this hop
+  atMs: number; // cumulative one-way latency when this hop happened
 }
 
 export interface TraceResult {
@@ -49,6 +36,7 @@ export interface TraceResult {
   dstIp?: string;
   proto: Proto;
   deliveredTo?: string;
+  rttMs: number; // one-way latency of this trace
 }
 
 export interface PingResult {
@@ -59,6 +47,7 @@ export interface PingResult {
   reply: TraceResult | null;
   summary: string;
   hint?: string;
+  rttMs?: number;
 }
 
 export interface ResolveResult {
@@ -78,9 +67,17 @@ export interface FetchResult {
   request?: TraceResult;
   reply?: TraceResult;
   title?: string;
+  headers?: string[];
   reason?: string;
   hint?: string;
   serverId?: string;
+  totalMs?: number;
+}
+
+export interface DhcpStep {
+  label: string; // DISCOVER / OFFER / REQUEST / ACK
+  text: string;
+  ok: boolean;
 }
 
 interface Packet {
@@ -104,21 +101,56 @@ const DEV_INFO: Record<DeviceKind, string> = {
   cloud: "the internet",
 };
 
+/** Seconds a device takes to come up after power-on. */
+export const BOOT_SECONDS: Record<DeviceKind, number> = {
+  pc: 6,
+  laptop: 5,
+  switch: 8,
+  router: 12,
+  server: 14,
+  modem: 18,
+  cloud: 0,
+};
+
+/** Per-packet processing delay in milliseconds. */
+const PROCESSING_MS: Record<DeviceKind, number> = {
+  pc: 0.08,
+  laptop: 0.08,
+  switch: 0.02,
+  router: 0.35,
+  server: 0.1,
+  modem: 0.6,
+  cloud: 0.2,
+};
+
+type Segment = { ifaces: Iface[]; paths: Map<string, { via: string[]; links: string[] }>; issues: string[] };
+
 export class Network {
   devices = new Map<string, Device>();
   links = new Map<string, Link>();
-  private segCache = new Map<string, { ifaces: Iface[]; paths: Map<string, { via: string[]; links: string[] }>; issues: string[] }>();
+  private segCache = new Map<string, Segment>();
   private topoVersion = 0;
   private segVersion = -1;
   conflicts = new Map<string, string>(); // ifaceId -> ip (duplicate address)
   dhcpFailures = new Map<string, string>(); // ifaceId -> reason
+  now: () => number = () => 0; // game seconds
+  clock: () => string = () => "--:--"; // in-game time label for logs
+
+  setClock(now: () => number, clock: () => string) {
+    this.now = now;
+    this.clock = clock;
+  }
 
   // ----------------------------------------------------------- lifecycle
   load(snap: NetworkSnapshot) {
     this.devices.clear();
     this.links.clear();
-    for (const d of snap.devices) this.devices.set(d.id, d);
-    for (const l of snap.links) this.links.set(l.id, l);
+    for (const d of snap.devices) {
+      for (const i of d.ifaces) if (!i.mac) i.mac = `02:4d:48:${d.id.length.toString(16).padStart(2, "0")}:00:${i.name.length.toString(16).padStart(2, "0")}`;
+      d.bootingUntil = undefined;
+      this.devices.set(d.id, d);
+    }
+    for (const l of snap.links) this.links.set(l.id, { ...l, medium: l.medium ?? "copper", lengthM: l.lengthM ?? 3 });
     this.touch();
   }
 
@@ -132,6 +164,14 @@ export class Network {
   touch() {
     this.topoVersion++;
     this.refresh();
+  }
+
+  // ----------------------------------------------------------- logs
+  log(deviceId: string, text: string, kind: LogEntry["kind"] = "info") {
+    const d = this.devices.get(deviceId);
+    if (!d || d.hidden) return;
+    (d.log ??= []).push({ t: this.clock(), text, kind });
+    if (d.log.length > 80) d.log.shift();
   }
 
   // ----------------------------------------------------------- lookups
@@ -178,11 +218,23 @@ export class Network {
     return [...this.devices.values()].find((d) => d.name.toLowerCase() === n);
   }
 
+  /** Powered on and finished booting. */
+  isUp(dev: Device): boolean {
+    if (!dev.power) return false;
+    if (dev.bootingUntil !== undefined && dev.bootingUntil > this.now()) return false;
+    return true;
+  }
+
+  isBooting(dev: Device): boolean {
+    return dev.power && dev.bootingUntil !== undefined && dev.bootingUntil > this.now();
+  }
+
   // ----------------------------------------------------------- mutations
   addDevice(kind: DeviceKind, buildingId: string, name: string, id?: string): Device {
     const did = id ?? `${kind}_${Math.random().toString(36).slice(2, 7)}`;
     const d = createDevice(kind, did, name, buildingId);
     this.devices.set(did, d);
+    this.log(did, `${name} installed in the rack.`);
     this.touch();
     return d;
   }
@@ -195,16 +247,71 @@ export class Network {
     this.touch();
   }
 
-  connect(aId: string, bId: string): Link | string {
+  setPower(deviceId: string, on: boolean) {
+    const d = this.devices.get(deviceId);
+    if (!d) return;
+    d.power = on;
+    if (on) {
+      d.bootingUntil = this.now() + BOOT_SECONDS[d.kind];
+      this.log(deviceId, `Power on. Booting (${BOOT_SECONDS[d.kind]} s)…`);
+    } else {
+      d.bootingUntil = undefined;
+      this.log(deviceId, "Power off.", "warn");
+      for (const i of d.ifaces) {
+        const peer = this.peerIface(i.id);
+        if (peer) this.log(peer.deviceId, `Link down on ${peer.name}: ${d.name} went away.`, "warn");
+      }
+    }
+    this.touch();
+  }
+
+  /** Called by the game loop; finishes boots whose timers expired. Returns true if anything changed. */
+  tickBoots(): boolean {
+    let changed = false;
+    for (const d of this.devices.values()) {
+      if (d.bootingUntil !== undefined && d.bootingUntil <= this.now()) {
+        d.bootingUntil = undefined;
+        changed = true;
+        this.log(d.id, "Boot complete. Interfaces up.");
+        for (const i of d.ifaces) {
+          if (this.linkState(i) === "up") {
+            const peer = this.peerIface(i.id)!;
+            this.log(peer.deviceId, `Link up on ${peer.name}: ${d.name} ${i.name} (${this.linkSpeed(this.links.get(i.linkId!)!)}).`);
+          }
+        }
+      }
+    }
+    if (changed) this.touch();
+    return changed;
+  }
+
+  connect(aId: string, bId: string, opts: { medium?: Medium; lengthM?: number } = {}): Link | string {
     const a = this.iface(aId);
     const b = this.iface(bId);
     if (!a || !b) return "Port not found.";
     if (a.linkId || b.linkId) return "One of those ports already has a cable in it.";
     if (a.deviceId === b.deviceId) return "You cannot connect a device to itself.";
-    const link: Link = { id: `link_${Math.random().toString(36).slice(2, 7)}`, a: aId, b: bId, damaged: false };
+    const link: Link = {
+      id: `link_${Math.random().toString(36).slice(2, 7)}`,
+      a: aId,
+      b: bId,
+      damaged: false,
+      medium: opts.medium ?? "copper",
+      lengthM: opts.lengthM ?? 3,
+    };
     this.links.set(link.id, link);
     a.linkId = link.id;
     b.linkId = link.id;
+    const da = this.devices.get(a.deviceId)!;
+    const db = this.devices.get(b.deviceId)!;
+    const issue = this.linkIssue(link);
+    if (issue) {
+      this.log(da.id, `${a.name}: cable to ${db.name} ${b.name} plugged in, but no link: ${issue}`, "error");
+      this.log(db.id, `${b.name}: cable to ${da.name} ${a.name} plugged in, but no link: ${issue}`, "error");
+    } else if (this.isUp(da) && this.isUp(db)) {
+      this.log(da.id, `Link up on ${a.name}: ${db.name} ${b.name} (${this.linkSpeed(link)}, ${MEDIA[link.medium].label}, ${link.lengthM} m).`);
+      this.log(db.id, `Link up on ${b.name}: ${da.name} ${a.name} (${this.linkSpeed(link)}, ${MEDIA[link.medium].label}, ${link.lengthM} m).`);
+    }
     this.touch();
     return link;
   }
@@ -214,16 +321,62 @@ export class Network {
     if (!l) return;
     const a = this.iface(l.a);
     const b = this.iface(l.b);
-    if (a) a.linkId = undefined;
-    if (b) b.linkId = undefined;
+    if (a) {
+      a.linkId = undefined;
+      this.log(a.deviceId, `Link down on ${a.name}: cable unplugged.`, "warn");
+    }
+    if (b) {
+      b.linkId = undefined;
+      this.log(b.deviceId, `Link down on ${b.name}: cable unplugged.`, "warn");
+    }
     this.links.delete(linkId);
     this.touch();
+  }
+
+  setDamaged(linkId: string, damaged: boolean) {
+    const l = this.links.get(linkId);
+    if (!l || l.damaged === damaged) return;
+    l.damaged = damaged;
+    for (const id of [l.a, l.b]) {
+      const i = this.iface(id);
+      if (i) this.log(i.deviceId, damaged ? `Link down on ${i.name}: no carrier (cable fault).` : `Link up on ${i.name}: cable replaced (${this.linkSpeed(l)}).`, damaged ? "error" : "info");
+    }
+    this.touch();
+  }
+
+  // ----------------------------------------------------------- physical layer
+  linkIssue(l: Link): string | null {
+    if (l.damaged) return "the cable is damaged";
+    const max = MEDIA[l.medium].maxM;
+    if (l.latencyMs === undefined && l.lengthM > max) return `${l.lengthM} m of ${MEDIA[l.medium].label.toLowerCase()} exceeds the ${max} m limit; the signal does not survive the run`;
+    return null;
+  }
+
+  linkSpeed(l: Link): string {
+    return l.latencyMs !== undefined ? "100 Mbit/s uplink" : MEDIA[l.medium].speed;
+  }
+
+  linkLatencyMs(l: Link): number {
+    if (l.latencyMs !== undefined) return l.latencyMs;
+    return 0.01 + (l.lengthM / 1000) * MEDIA[l.medium].latencyPerKm;
+  }
+
+  /** Is this interface physically connected to anything live? */
+  linkState(i: Iface): "none" | "down" | "up" {
+    if (!i.linkId) return "none";
+    const l = this.links.get(i.linkId);
+    if (!l || this.linkIssue(l)) return "down";
+    const peer = this.peerIface(i.id);
+    const dev = this.devices.get(i.deviceId);
+    const pdev = peer ? this.devices.get(peer.deviceId) : undefined;
+    if (!dev || !pdev || !this.isUp(dev) || !this.isUp(pdev)) return "down";
+    return "up";
   }
 
   // ----------------------------------------------------------- addressing
   effective(i: Iface): EffectiveAddr | null {
     const dev = this.devices.get(i.deviceId);
-    if (!dev || !dev.power) return null;
+    if (!dev || !this.isUp(dev)) return null;
     if (i.mode === "static") {
       const ip = parseIp(i.ip);
       if (ip === null || !i.prefix) return null;
@@ -234,13 +387,7 @@ export class Network {
     if (i.mode === "dhcp" && i.lease) {
       const ip = parseIp(i.lease.ip);
       if (ip === null) return null;
-      return {
-        ip,
-        prefix: i.lease.prefix,
-        gateway: parseIp(i.lease.gateway) ?? undefined,
-        dns: parseIp(i.lease.dns) ?? undefined,
-        source: "dhcp",
-      };
+      return { ip, prefix: i.lease.prefix, gateway: parseIp(i.lease.gateway) ?? undefined, dns: parseIp(i.lease.dns) ?? undefined, source: "dhcp" };
     }
     return null;
   }
@@ -255,7 +402,7 @@ export class Network {
 
   validateStatic(i: Iface): string | null {
     if (i.mode !== "static") return null;
-    if (!i.ip && !i.prefix) return null; // unconfigured, not invalid
+    if (!i.ip && !i.prefix) return null;
     const ip = parseIp(i.ip);
     if (ip === null) return "IP address is not valid (expected four numbers 0-255 separated by dots).";
     if (!i.prefix) return "Subnet mask is missing.";
@@ -270,8 +417,8 @@ export class Network {
   }
 
   // ----------------------------------------------------------- L2 segments
-  /** Every non-switch interface reachable from `ifaceId` through cables and powered switches. */
-  segment(ifaceId: string, physicalOnly = false): { ifaces: Iface[]; paths: Map<string, { via: string[]; links: string[] }>; issues: string[] } {
+  /** Every non-switch interface reachable from `ifaceId` through cables and live switches. */
+  segment(ifaceId: string, physicalOnly = false): Segment {
     if (this.segVersion !== this.topoVersion) {
       this.segCache.clear();
       this.segVersion = this.topoVersion;
@@ -280,12 +427,10 @@ export class Network {
     const cached = this.segCache.get(cacheKey);
     if (cached) return cached;
 
-    const result = { ifaces: [] as Iface[], paths: new Map<string, { via: string[]; links: string[] }>(), issues: [] as string[] };
+    const result: Segment = { ifaces: [], paths: new Map(), issues: [] };
     const start = this.iface(ifaceId);
     if (!start) return result;
     const startDev = this.devices.get(start.deviceId)!;
-    // BFS over (iface) nodes. From an iface we cross its link; if the far device is a switch we
-    // fan out to all its other ports.
     const visitedDevices = new Set<string>([startDev.id]);
     const queue: { iface: Iface; via: string[]; links: string[] }[] = [{ iface: start, via: [], links: [] }];
     while (queue.length) {
@@ -297,13 +442,14 @@ export class Network {
       if (!far) continue;
       const farDev = this.devices.get(far.deviceId);
       if (!farDev) continue;
-      if (link.damaged) {
+      const issue = this.linkIssue(link);
+      if (issue) {
         if (!physicalOnly) continue;
-        result.issues.push(`the cable between ${this.devices.get(cur.iface.deviceId)?.name} ${cur.iface.name} and ${farDev.name} ${far.name} is damaged`);
+        result.issues.push(`the cable between ${this.devices.get(cur.iface.deviceId)?.name} ${cur.iface.name} and ${farDev.name} ${far.name} has no link (${issue})`);
       }
-      if (!farDev.power) {
+      if (!this.isUp(farDev)) {
         if (!physicalOnly) continue;
-        result.issues.push(`${farDev.name} is powered off`);
+        result.issues.push(this.isBooting(farDev) ? `${farDev.name} is still booting` : `${farDev.name} is powered off`);
       }
       if (visitedDevices.has(farDev.id)) continue;
       visitedDevices.add(farDev.id);
@@ -320,80 +466,113 @@ export class Network {
     return result;
   }
 
-  /** Is this interface physically connected to anything live? */
-  linkState(i: Iface): "none" | "down" | "up" {
-    if (!i.linkId) return "none";
-    const l = this.links.get(i.linkId);
-    if (!l || l.damaged) return "down";
-    const peer = this.peerIface(i.id);
-    const dev = this.devices.get(i.deviceId);
-    const pdev = peer ? this.devices.get(peer.deviceId) : undefined;
-    if (!dev?.power || !pdev?.power) return "down";
-    return "up";
+  /** What a switch has learned: for each port, the MAC addresses reachable behind it. */
+  macTable(switchId: string): { port: string; entries: { mac: string; device: string; iface: string; ip?: string }[] }[] {
+    const sw = this.devices.get(switchId);
+    if (!sw || sw.kind !== "switch") return [];
+    const out: { port: string; entries: { mac: string; device: string; iface: string; ip?: string }[] }[] = [];
+    for (const p of sw.ifaces) {
+      if (this.linkState(p) !== "up") continue;
+      const seg = this.segment(p.id);
+      out.push({
+        port: p.name,
+        entries: seg.ifaces.map((i) => {
+          const e = this.effective(i);
+          return { mac: i.mac, device: this.devices.get(i.deviceId)!.name, iface: i.name, ip: e ? ipToStr(e.ip) : undefined };
+        }),
+      });
+    }
+    return out;
+  }
+
+  /** The ARP cache a host would have after talking to its neighbours. */
+  arpTable(deviceId: string): { iface: string; ip: string; mac: string; device: string }[] {
+    const d = this.devices.get(deviceId);
+    if (!d) return [];
+    const out: { iface: string; ip: string; mac: string; device: string }[] = [];
+    for (const i of d.ifaces) {
+      const e = this.effective(i);
+      if (!e || this.linkState(i) !== "up") continue;
+      for (const n of this.segment(i.id).ifaces) {
+        const ne = this.effective(n);
+        if (ne && sameSubnet(ne.ip, e.ip, e.prefix)) out.push({ iface: i.name, ip: ipToStr(ne.ip), mac: n.mac, device: this.devices.get(n.deviceId)!.name });
+      }
+    }
+    return out;
   }
 
   // ----------------------------------------------------------- DHCP
   refresh() {
     this.dhcpFailures.clear();
-    // Clear existing leases then re-allocate deterministically.
-    const clients: Iface[] = [];
+    const clients: { iface: Iface; before?: string }[] = [];
     for (const d of this.devices.values())
       for (const i of d.ifaces) {
         if (i.mode === "dhcp") {
+          clients.push({ iface: i, before: i.lease?.ip });
           i.lease = undefined;
-          clients.push(i);
         }
       }
-    clients.sort((a, b) => a.id.localeCompare(b.id));
-    // Two passes so segments see static addresses before allocating.
-    for (const c of clients) {
-      const dev = this.devices.get(c.deviceId)!;
-      if (!dev.power) continue;
-      if (this.linkState(c) !== "up") {
-        this.dhcpFailures.set(c.id, "No link. Plug the cable in first.");
+    clients.sort((a, b) => a.iface.id.localeCompare(b.iface.id));
+    for (const { iface: c, before } of clients) {
+      const r = this.allocate(c);
+      if (typeof r === "string") {
+        this.dhcpFailures.set(c.id, r);
+        if (before) this.log(c.deviceId, `${c.name}: lease for ${before} lost (${r})`, "warn");
         continue;
       }
-      const seg = this.segment(c.id);
-      const servers = seg.ifaces.filter((s) => s.dhcp?.enabled && this.devices.get(s.deviceId)?.power);
-      if (servers.length === 0) {
-        this.dhcpFailures.set(c.id, "No DHCP server answered on this network.");
-        continue;
+      c.lease = r;
+      if (r.ip !== before) {
+        this.log(c.deviceId, `${c.name}: DHCP lease ${r.ip}/${r.prefix} from ${this.devices.get(r.serverId)?.name}${r.gateway ? `, gateway ${r.gateway}` : ""}${r.dns ? `, DNS ${r.dns}` : ""}.`);
+        this.log(r.serverId, `DHCP: leased ${r.ip} to ${this.devices.get(c.deviceId)?.name} (${c.mac}).`);
       }
-      const srv = servers[0];
-      const cfg = srv.dhcp!;
-      const start = parseIp(cfg.start);
-      const end = parseIp(cfg.end);
-      if (start === null || end === null || end < start) {
-        this.dhcpFailures.set(c.id, `DHCP server on ${this.devices.get(srv.deviceId)?.name} has an invalid address pool.`);
-        continue;
-      }
-      const used = new Set<number>();
-      for (const other of seg.ifaces) {
-        const e = this.effective(other);
-        if (e) used.add(e.ip);
-      }
-      const selfEff = this.effective(srv);
-      if (selfEff) used.add(selfEff.ip);
-      let chosen: number | null = null;
-      for (let ip = start; ip <= end; ip++) {
-        if (!used.has(ip)) {
-          chosen = ip;
-          break;
-        }
-      }
-      if (chosen === null) {
-        this.dhcpFailures.set(c.id, "The DHCP pool is full. No addresses left to hand out.");
-        continue;
-      }
-      c.lease = {
-        ip: ipToStr(chosen),
-        prefix: cfg.prefix,
-        gateway: cfg.gateway || undefined,
-        dns: cfg.dns || undefined,
-        serverId: srv.deviceId,
-      };
     }
     this.detectConflicts();
+  }
+
+  /** Pick an address for a DHCP client, or explain why none is available. */
+  private allocate(c: Iface): Lease | string {
+    const dev = this.devices.get(c.deviceId)!;
+    if (!this.isUp(dev)) return this.isBooting(dev) ? "Still booting." : "Powered off.";
+    if (this.linkState(c) !== "up") return "No link. Plug the cable in first.";
+    const seg = this.segment(c.id);
+    const servers = seg.ifaces.filter((s) => s.dhcp?.enabled && this.isUp(this.devices.get(s.deviceId)!));
+    if (servers.length === 0) return "No DHCP server answered on this network.";
+    const srv = servers[0];
+    const cfg = srv.dhcp!;
+    const start = parseIp(cfg.start);
+    const end = parseIp(cfg.end);
+    if (start === null || end === null || end < start) return `DHCP server on ${this.devices.get(srv.deviceId)?.name} has an invalid address pool.`;
+    const used = new Set<number>();
+    for (const other of seg.ifaces) {
+      const e = this.effective(other);
+      if (e) used.add(e.ip);
+    }
+    const selfEff = this.effective(srv);
+    if (selfEff) used.add(selfEff.ip);
+    for (let ip = start; ip <= end; ip++) {
+      if (!used.has(ip)) return { ip: ipToStr(ip), prefix: cfg.prefix, gateway: cfg.gateway || undefined, dns: cfg.dns || undefined, serverId: srv.deviceId };
+    }
+    return "The DHCP pool is full. No addresses left to hand out.";
+  }
+
+  /** The four-step DHCP conversation for one client, for the terminal. */
+  dhcpTransaction(deviceId: string): DhcpStep[] {
+    const d = this.devices.get(deviceId);
+    const c = d?.ifaces.find((i) => i.mode === "dhcp") ?? d?.ifaces[0];
+    if (!d || !c) return [{ label: "ERROR", text: "No interface.", ok: false }];
+    if (c.mode !== "dhcp") return [{ label: "SKIP", text: `${c.name} is configured statically; DHCP is not used. Switch the interface to DHCP to see the exchange.`, ok: false }];
+    const steps: DhcpStep[] = [];
+    steps.push({ label: "DISCOVER", text: `${d.name} broadcasts from ${c.mac} to ff:ff:ff:ff:ff:ff: "Is there a DHCP server out there?"`, ok: true });
+    const r = this.allocate(c);
+    if (typeof r === "string") {
+      steps.push({ label: "TIMEOUT", text: `No offer received. ${r}`, ok: false });
+      return steps;
+    }
+    const srv = this.devices.get(r.serverId)!;
+    steps.push({ label: "OFFER", text: `${srv.name} answers: "You can have ${r.ip}/${r.prefix}${r.gateway ? `, gateway ${r.gateway}` : ""}${r.dns ? `, DNS ${r.dns}` : ""}."`, ok: true });
+    steps.push({ label: "REQUEST", text: `${d.name} broadcasts: "I'll take ${r.ip} from ${srv.name}."`, ok: true });
+    steps.push({ label: "ACK", text: `${srv.name} confirms the lease. ${d.name} configures ${c.name} and can start talking.`, ok: true });
+    return steps;
   }
 
   private detectConflicts() {
@@ -416,7 +595,6 @@ export class Network {
 
   // ----------------------------------------------------------- routing
   private lookupRoute(dev: Device, dst: number): { iface: Iface; nextHop?: number } | null {
-    // 1. connected networks (longest prefix)
     let best: { iface: Iface; nextHop?: number; prefix: number } | null = null;
     for (const i of dev.ifaces) {
       const e = this.effective(i);
@@ -424,7 +602,6 @@ export class Network {
       if (sameSubnet(dst, e.ip, e.prefix) && (!best || e.prefix > best.prefix)) best = { iface: i, prefix: e.prefix };
     }
     if (best) return best;
-    // 2. static routes (routers)
     for (const r of dev.routes) {
       const net = parseIp(r.dest);
       const via = parseIp(r.via);
@@ -437,12 +614,9 @@ export class Network {
       if (out && (!best || r.prefix > best.prefix)) best = { iface: out, nextHop: via, prefix: r.prefix };
     }
     if (best) return best;
-    // 3. default gateway from any interface (static or learned via DHCP)
     for (const i of dev.ifaces) {
       const e = this.effective(i);
-      if (e?.gateway !== undefined) {
-        if (sameSubnet(e.gateway, e.ip, e.prefix)) return { iface: i, nextHop: e.gateway };
-      }
+      if (e?.gateway !== undefined && sameSubnet(e.gateway, e.ip, e.prefix)) return { iface: i, nextHop: e.gateway };
     }
     return null;
   }
@@ -453,69 +627,61 @@ export class Network {
       if (rule.src && !inCidr(pkt.src, rule.src)) continue;
       if (rule.dst && !inCidr(pkt.dst, rule.dst)) continue;
       if (rule.action === "deny") return rule.note || `rule: deny ${rule.proto} from ${rule.src || "any"} to ${rule.dst || "any"}`;
-      return null; // explicit allow
+      return null;
     }
     return null;
   }
 
   /** Forward a packet from a device until delivered or dropped. */
-  forward(fromDeviceId: string, dst: number, proto: Proto, ctx: { nat: Map<string, NatMapping>; reply: boolean }, srcIp?: number): TraceResult {
+  forward(fromDeviceId: string, dst: number, proto: Proto, ctx: { nat: Map<string, NatMapping>; reply: boolean; quiet?: boolean }, srcIp?: number): TraceResult {
     const hops: Hop[] = [];
     const pkt: Packet = { src: srcIp ?? 0, dst, proto };
     let cur = this.devices.get(fromDeviceId);
-    const res: TraceResult = { ok: false, hops, proto, dstIp: ipToStr(dst) };
+    const res: TraceResult = { ok: false, hops, proto, dstIp: ipToStr(dst), rttMs: 0 };
     if (!cur) return { ...res, reason: "Source device not found." };
     let ttl = 16;
     let lastIn: string | undefined;
-    const fail = (reason: string, hint?: string, dev?: Device) => {
-      hops.push({ deviceId: (dev ?? cur)!.id, ifaceIn: lastIn, action: "Dropped", detail: reason, ok: false, via: [], linkIds: [] });
+    let tMs = 0;
+    const fail = (reason: string, hint?: string) => {
+      hops.push({ deviceId: cur!.id, ifaceIn: lastIn, action: "Dropped", detail: reason, ok: false, via: [], linkIds: [], atMs: tMs });
       res.reason = reason;
       res.hint = hint;
       res.srcIp = pkt.src ? ipToStr(pkt.src) : undefined;
+      res.rttMs = tMs;
       return res;
     };
 
     while (ttl-- > 0) {
-      if (!cur.power) return fail(`${cur.name} is powered off.`, "Turn the device on.");
+      if (!this.isUp(cur)) return fail(this.isBooting(cur) ? `${cur.name} is still booting.` : `${cur.name} is powered off.`, this.isBooting(cur) ? "Give it a few seconds." : "Turn the device on.");
+      tMs += PROCESSING_MS[cur.kind];
 
-      // Is the packet for us?
       const local = cur.ifaces.find((i) => this.effective(i)?.ip === pkt.dst);
       if (local) {
         const nat = ctx.nat.get(cur.id);
         if (ctx.reply && nat && nat.outer === pkt.dst) {
-          hops.push({
-            deviceId: cur.id,
-            ifaceIn: lastIn,
-            action: "NAT: translated back",
-            detail: `Reply arrived for ${ipToStr(nat.outer)}; the router remembers this belongs to ${ipToStr(nat.inner)} and rewrites the destination.`,
-            ok: true,
-            via: [],
-            linkIds: [],
-          });
+          hops.push({ deviceId: cur.id, ifaceIn: lastIn, action: "NAT: translated back", detail: `Reply arrived for ${ipToStr(nat.outer)}; the router remembers this belongs to ${ipToStr(nat.inner)} and rewrites the destination.`, ok: true, via: [], linkIds: [], atMs: tMs });
           pkt.dst = nat.inner;
-          // continue forwarding inward
         } else {
           const dupHere = this.conflicts.has(local.id);
-          hops.push({ deviceId: cur.id, ifaceIn: lastIn, action: "Delivered", detail: `${cur.name} accepted the ${proto === "any" ? "" : proto + " "}packet.${dupHere ? ` ⚠ But ${ipToStr(pkt.dst)} is a duplicate address; is ${cur.name} really who you meant?` : ""}`, ok: true, via: [], linkIds: [] });
+          hops.push({ deviceId: cur.id, ifaceIn: lastIn, action: "Delivered", detail: `${cur.name} accepted the ${proto === "any" ? "" : proto + " "}packet.${dupHere ? ` ⚠ But ${ipToStr(pkt.dst)} is a duplicate address; is ${cur.name} really who you meant?` : ""}`, ok: true, via: [], linkIds: [], atMs: tMs });
           res.ok = true;
           res.srcIp = ipToStr(pkt.src);
           res.deliveredTo = cur.id;
+          res.rttMs = tMs;
           return res;
         }
       }
 
-      // Hosts do not forward other people's packets.
       if (hops.length > 0 && !isRouterKind(cur.kind) && !(ctx.reply && ctx.nat.has(cur.id))) {
-        return fail(
-          `${cur.name} received a packet addressed to ${ipToStr(pkt.dst)}, but ${cur.name} is ${DEV_INFO[cur.kind]} and not a router, so it dropped it.`,
-          "Only routers pass packets between networks. Check the gateway address points at a router."
-        );
+        return fail(`${cur.name} received a packet addressed to ${ipToStr(pkt.dst)}, but ${cur.name} is ${DEV_INFO[cur.kind]} and not a router, so it dropped it.`, "Only routers pass packets between networks. Check the gateway address points at a router.");
       }
 
-      // Firewall on transit through routers
       if (hops.length > 0 && isRouterKind(cur.kind)) {
         const blocked = this.aclCheck(cur, pkt);
-        if (blocked) return fail(`${cur.name} blocked this packet (${blocked}).`, "Look at the firewall rules on the router.");
+        if (blocked) {
+          if (!ctx.quiet) this.log(cur.id, `FIREWALL deny ${pkt.proto} ${ipToStr(pkt.src)} → ${ipToStr(pkt.dst)} (${blocked})`, "warn");
+          return fail(`${cur.name} blocked this packet (${blocked}).`, "Look at the firewall rules on the router.");
+        }
       }
 
       const route = this.lookupRoute(cur, pkt.dst);
@@ -530,7 +696,6 @@ export class Network {
       const outEff = this.effective(out)!;
       if (hops.length === 0 && !pkt.src) pkt.src = outEff.ip;
 
-      // NAT on egress
       let natNote: string | undefined;
       if (out.nat && isRouterKind(cur.kind) && !ctx.reply && isPrivate(pkt.src)) {
         ctx.nat.set(cur.id, { inner: pkt.src, outer: outEff.ip });
@@ -541,20 +706,22 @@ export class Network {
       const ls = this.linkState(out);
       if (ls === "none") return fail(`Nothing is plugged into ${out.name} on ${cur.name}.`, "Run a cable from that port to a switch or the next device.");
       if (ls === "down") {
-        const l = this.links.get(out.linkId!);
-        return fail(l?.damaged ? `The cable on ${cur.name} ${out.name} is damaged. No link.` : `The link on ${cur.name} ${out.name} is down (the other side is off).`, l?.damaged ? "Replace the damaged cable." : "Power on the device at the other end.");
+        const l = this.links.get(out.linkId!)!;
+        const issue = this.linkIssue(l);
+        const peerDev = this.devices.get(this.peerIface(out.id)!.deviceId)!;
+        if (issue) return fail(`No link on ${cur.name} ${out.name}: ${issue}.`, l.damaged ? "Replace the damaged cable." : "Use fiber for long runs, or put a switch in between to split the distance.");
+        return fail(`The link on ${cur.name} ${out.name} is down: ${peerDev.name} is ${this.isBooting(peerDev) ? "still booting" : "powered off"}.`, this.isBooting(peerDev) ? "Wait a few seconds." : "Power on the device at the other end.");
       }
 
       const nextIp = route.nextHop ?? pkt.dst;
       const seg = this.segment(out.id);
       const claimants = seg.ifaces.filter((i) => this.effective(i)?.ip === nextIp);
-      // With a duplicate address the wrong device tends to answer first: the imposter wins.
       let dupNote: string | undefined;
       let target = claimants[0];
       if (claimants.length > 1) {
         const imposter = claimants.find((c) => !isRouterKind(this.devices.get(c.deviceId)!.kind)) ?? claimants[claimants.length - 1];
         target = imposter;
-        dupNote = `⚠ ${claimants.length} devices claim ${ipToStr(nextIp)} (${claimants.map((c) => this.devices.get(c.deviceId)?.name).join(", ")}). ${this.devices.get(imposter.deviceId)?.name} answered first, so the frame went there.`;
+        dupNote = `⚠ ${claimants.length} devices claim ${ipToStr(nextIp)} (${claimants.map((c) => this.devices.get(c.deviceId)?.name).join(", ")}). ${this.devices.get(imposter.deviceId)?.name} answered the ARP request first, so the frame went there.`;
       }
       if (!target) {
         const elsewhere = this.findByIp(nextIp);
@@ -564,17 +731,17 @@ export class Network {
         let detail: string;
         let hint: string;
         if (physicallyThere && phys.issues.length) {
-          detail = `No reply from ${ipToStr(nextIp)}: the path is physically broken. ${phys.issues.map((x) => x[0].toUpperCase() + x.slice(1)).join("; ")}.`;
-          hint = phys.issues.some((x) => x.includes("damaged")) ? "Find the red port and replace the cable." : "Power the device back on.";
+          detail = `ARP for ${ipToStr(nextIp)} got no reply: the path is physically broken. ${phys.issues.map((x) => x[0].toUpperCase() + x.slice(1)).join("; ")}.`;
+          hint = phys.issues.some((x) => x.includes("damaged")) ? "Find the red port and replace the cable." : phys.issues.some((x) => x.includes("exceeds")) ? "That run is too long for copper. Use fiber or add a switch halfway." : "Power the device back on, or wait for it to boot.";
           return fail(detail, hint);
         }
         if (route.nextHop !== undefined) {
-          detail = `${cur.name} tried to hand the packet to gateway ${ipToStr(nextIp)}, but no device with that address is on the network attached to ${out.name}.`;
+          detail = `${cur.name} sent an ARP request for gateway ${ipToStr(nextIp)}, but no device with that address is on the network attached to ${out.name}.`;
           hint = elsewhere.length
             ? `${this.devices.get(elsewhere[0].deviceId)?.name} does have ${ipToStr(nextIp)}, but it is not reachable through this cable. Check the cabling or the gateway address.`
             : "Does the router really have that address on this side? Compare the gateway with the router's LAN interface.";
         } else {
-          detail = `${ipToStr(nextIp)} should be on the same local network as ${cur.name}, but no live device with that address answered (ARP got no reply).`;
+          detail = `${ipToStr(nextIp)} should be on the same local network as ${cur.name}, but no live device answered the ARP request.`;
           hint = elsewhere.length
             ? `${this.devices.get(elsewhere[0].deviceId)?.name} has that address but sits on a different network segment. A router is needed between them, or move it onto this switch.`
             : "Is the destination powered on, cabled in and configured with that address?";
@@ -583,6 +750,9 @@ export class Network {
         return fail(detail, hint);
       }
       const path = seg.paths.get(target.id)!;
+      // latency across the links and switches on the way
+      for (const lid of path.links) tMs += this.linkLatencyMs(this.links.get(lid)!);
+      tMs += path.via.length * PROCESSING_MS.switch;
       hops.push({
         deviceId: cur.id,
         ifaceIn: lastIn,
@@ -592,6 +762,8 @@ export class Network {
         ok: true,
         via: path.via,
         linkIds: path.links,
+        arp: { ip: ipToStr(nextIp), mac: target.mac, device: this.devices.get(target.deviceId)!.name },
+        atMs: tMs,
       });
       if (dupNote) hops[hops.length - 1].detail = dupNote;
       lastIn = target.id;
@@ -601,30 +773,30 @@ export class Network {
   }
 
   // ----------------------------------------------------------- high level ops
-  ping(fromDeviceId: string, target: string): PingResult {
+  ping(fromDeviceId: string, target: string, quiet = true): PingResult {
     const from = this.devices.get(fromDeviceId);
     if (!from) return { ok: false, target, request: null, reply: null, summary: "Device not found." };
     let dst = parseIp(target);
     let resolved: string | undefined;
     if (dst === null) {
-      const r = this.resolve(fromDeviceId, target);
+      const r = this.resolve(fromDeviceId, target, quiet);
       if (!r.ok) return { ok: false, target, request: r.trace ?? null, reply: null, summary: `ping: cannot resolve ${target}: ${r.reason}`, hint: r.hint };
       dst = parseIp(r.ip!)!;
       resolved = r.ip;
     }
     const nat = new Map<string, NatMapping>();
-    const req = this.forward(fromDeviceId, dst, "icmp", { nat, reply: false });
+    const req = this.forward(fromDeviceId, dst, "icmp", { nat, reply: false, quiet });
     if (!req.ok) return { ok: false, target, resolved, request: req, reply: null, summary: `Request failed: ${req.reason}`, hint: req.hint };
     const dstDev = req.deliveredTo!;
     const replyTo = parseIp(req.srcIp!)!;
-    const rep = this.forward(dstDev, replyTo, "icmp", { nat, reply: true });
-    if (!rep.ok)
-      return { ok: false, target, resolved, request: req, reply: rep, summary: `Request arrived, but the reply failed: ${rep.reason}`, hint: rep.hint ?? "Routing must work in both directions." };
+    const rep = this.forward(dstDev, replyTo, "icmp", { nat, reply: true, quiet });
+    if (!rep.ok) return { ok: false, target, resolved, request: req, reply: rep, summary: `Request arrived, but the reply failed: ${rep.reason}`, hint: rep.hint ?? "Routing must work in both directions." };
     const hopsOut = req.hops.filter((h) => h.ok).length - 1;
-    return { ok: true, target, resolved, request: req, reply: rep, summary: `Reply from ${ipToStr(dst)}: time=${2 + hopsOut * 3}ms, ${hopsOut} hop${hopsOut === 1 ? "" : "s"}` };
+    const rtt = req.rttMs + rep.rttMs;
+    return { ok: true, target, resolved, request: req, reply: rep, rttMs: rtt, summary: `Reply from ${ipToStr(dst)}: time=${rtt.toFixed(2)} ms, ${hopsOut} hop${hopsOut === 1 ? "" : "s"}` };
   }
 
-  resolve(fromDeviceId: string, name: string): ResolveResult {
+  resolve(fromDeviceId: string, name: string, quiet = true): ResolveResult {
     const lit = parseIp(name);
     if (lit !== null) return { ok: true, ip: name };
     const from = this.devices.get(fromDeviceId);
@@ -633,17 +805,18 @@ export class Network {
     if (!addr) return { ok: false, reason: `${from.name} has no IP address`, hint: "Configure an address before trying to use names." };
     if (addr.dns === undefined) return { ok: false, reason: `${from.name} has no DNS server configured`, hint: "Set a DNS server address (static) or let DHCP hand one out." };
     const nat = new Map<string, NatMapping>();
-    const trace = this.forward(fromDeviceId, addr.dns, "dns", { nat, reply: false });
+    const trace = this.forward(fromDeviceId, addr.dns, "dns", { nat, reply: false, quiet });
     if (!trace.ok) return { ok: false, reason: `cannot reach DNS server ${ipToStr(addr.dns)}: ${trace.reason}`, hint: trace.hint, trace };
     const server = this.devices.get(trace.deliveredTo!)!;
     const svc = server.services.dns;
-    if (!svc?.enabled) return { ok: false, reason: `${server.name} (${ipToStr(addr.dns)}) is not running a DNS service`, hint: "Point the client at a real DNS server, or enable DNS on that server.", trace, serverId: server.id };
-    const lookup = this.lookupName(server, name, 0);
+    if (!svc?.enabled) return { ok: false, reason: `${server.name} (${ipToStr(addr.dns)}) is not running a DNS service (port 53 closed)`, hint: "Point the client at a real DNS server, or enable DNS on that server.", trace, serverId: server.id };
+    const lookup = this.lookupName(server, name, 0, quiet);
+    if (!quiet) this.log(server.id, lookup.ok ? `DNS: ${name} → ${lookup.ip} for ${from.name}${lookup.viaForwarder ? " (via forwarder)" : ""}` : `DNS: NXDOMAIN ${name} for ${from.name}`, lookup.ok ? "info" : "warn");
     if (!lookup.ok) return { ...lookup, trace, serverId: server.id };
     return { ok: true, ip: lookup.ip, trace, serverId: server.id, viaForwarder: lookup.viaForwarder };
   }
 
-  private lookupName(server: Device, name: string, depth: number): ResolveResult {
+  private lookupName(server: Device, name: string, depth: number, quiet: boolean): ResolveResult {
     const svc = server.services.dns!;
     const n = name.toLowerCase().replace(/\.$/, "");
     const rec = svc.records.find((r) => r.name.toLowerCase() === n);
@@ -653,36 +826,57 @@ export class Network {
     }
     const fwd = parseIp(svc.forwarder);
     if (fwd !== null && depth < 3) {
-      const t = this.forward(server.id, fwd, "dns", { nat: new Map(), reply: false });
+      const t = this.forward(server.id, fwd, "dns", { nat: new Map(), reply: false, quiet });
       if (!t.ok) return { ok: false, reason: `${server.name} has no record for ${n} and could not reach its forwarder ${svc.forwarder}: ${t.reason}`, hint: t.hint };
       const up = this.devices.get(t.deliveredTo!)!;
       if (!up.services.dns?.enabled) return { ok: false, reason: `forwarder ${svc.forwarder} is not a DNS server` };
-      const r = this.lookupName(up, name, depth + 1);
+      const r = this.lookupName(up, name, depth + 1, quiet);
       return r.ok ? { ...r, viaForwarder: true } : r;
     }
     return { ok: false, reason: `${server.name} has no DNS record for "${n}"`, hint: fwd === null ? "Add a record for that name, or set a forwarder so unknown names are looked up upstream." : undefined };
   }
 
-  fetch(fromDeviceId: string, url: string): FetchResult {
+  fetch(fromDeviceId: string, url: string, quiet = true): FetchResult {
     const m = /^(?:https?:\/\/)?([^/:\s]+)(?::\d+)?(\/.*)?$/.exec(url.trim());
     if (!m) return { ok: false, url, reason: "That does not look like a URL." };
     const host = m[1];
-    const resolve = this.resolve(fromDeviceId, host);
+    const pathPart = m[2] || "/";
+    const from = this.devices.get(fromDeviceId);
+    const resolve = this.resolve(fromDeviceId, host, quiet);
     if (!resolve.ok) return { ok: false, url, resolve, reason: `Could not resolve ${host}: ${resolve.reason}`, hint: resolve.hint };
     const dst = parseIp(resolve.ip!)!;
     const nat = new Map<string, NatMapping>();
-    const request = this.forward(fromDeviceId, dst, "http", { nat, reply: false });
+    const request = this.forward(fromDeviceId, dst, "http", { nat, reply: false, quiet });
     if (!request.ok) return { ok: false, url, resolve, request, reason: `Could not connect to ${host} (${resolve.ip}): ${request.reason}`, hint: request.hint };
     const server = this.devices.get(request.deliveredTo!)!;
     const http = server.services.http;
-    if (!http?.enabled)
+    if (!http?.enabled) {
+      if (!quiet) this.log(server.id, `TCP: connection to port 80 from ${request.srcIp} refused (no service listening).`, "warn");
       return { ok: false, url, resolve, request, serverId: server.id, reason: `${server.name} answered at ${resolve.ip} but nothing is listening on port 80 (connection refused).`, hint: "Enable the web service on that server." };
+    }
     const hostOk = parseIp(host) !== null || http.hostnames.map((h) => h.toLowerCase()).includes(host.toLowerCase());
-    if (!hostOk)
+    if (!hostOk) {
+      if (!quiet) this.log(server.id, `HTTP: ${request.srcIp} GET ${pathPart} Host: ${host} → 404 (unknown host)`, "warn");
       return { ok: false, url, resolve, request, serverId: server.id, reason: `${server.name} is a web server, but it does not serve the site "${host}" (404 unknown host).`, hint: `Add "${host}" to the hostnames the web service answers for.` };
-    const reply = this.forward(server.id, parseIp(request.srcIp!)!, "http", { nat, reply: true });
+    }
+    const reply = this.forward(server.id, parseIp(request.srcIp!)!, "http", { nat, reply: true, quiet });
     if (!reply.ok) return { ok: false, url, resolve, request, reply, serverId: server.id, reason: `The server received the request but its reply never came back: ${reply.reason}`, hint: reply.hint };
-    return { ok: true, url, resolve, request, reply, serverId: server.id, title: http.title || host };
+    if (!quiet) this.log(server.id, `HTTP: ${request.srcIp} "GET ${pathPart}" Host: ${host} → 200 OK (${from?.name ?? "client"})`);
+    const title = http.title || host;
+    const body = `<title>${title}</title>`;
+    // A TCP handshake costs a round trip before the request, then request + response.
+    const totalMs = (request.rttMs + reply.rttMs) * 2 + (resolve.trace ? resolve.trace.rttMs * 2 : 0);
+    return {
+      ok: true,
+      url,
+      resolve,
+      request,
+      reply,
+      serverId: server.id,
+      title,
+      headers: ["HTTP/1.1 200 OK", `Server: ${server.kind === "cloud" ? "nginx/1.24" : "hollow-httpd/1.2"}`, "Content-Type: text/html; charset=utf-8", `Content-Length: ${body.length}`, `Date: ${this.clock()}`],
+      totalMs,
+    };
   }
 
   /** Quick reachability used by needs/traffic: ping both ways. */
@@ -694,6 +888,8 @@ export class Network {
   describeIface(i: Iface): string {
     const e = this.effective(i);
     if (i.mode === "none") return "L2 port";
+    const dev = this.devices.get(i.deviceId);
+    if (dev && this.isBooting(dev)) return "booting…";
     if (!e) {
       if (i.mode === "dhcp") return this.dhcpFailures.get(i.id) ? `DHCP: ${this.dhcpFailures.get(i.id)}` : "DHCP: waiting";
       const err = this.validateStatic(i);

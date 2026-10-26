@@ -25,6 +25,7 @@ export interface Iface {
   id: string;
   name: string;
   deviceId: string;
+  mac: string;
   mode: IfaceMode;
   ip?: string;
   prefix?: number;
@@ -78,13 +79,31 @@ export interface Device {
   hidden?: boolean; // not shown in any workspace (the internet)
   fixed?: boolean; // cannot be removed
   note?: string;
+  bootingUntil?: number; // game time when the device finishes booting
+  log?: LogEntry[];
 }
+
+export type Medium = "copper" | "fiber";
 
 export interface Link {
   id: string;
   a: string; // iface id
   b: string; // iface id
   damaged: boolean;
+  medium: Medium;
+  lengthM: number; // physical run length in metres
+  latencyMs?: number; // override (used for the provider uplink)
+}
+
+export const MEDIA: Record<Medium, { label: string; maxM: number; speed: string; latencyPerKm: number; description: string }> = {
+  copper: { label: "Copper (Cat6)", maxM: 100, speed: "1 Gbit/s", latencyPerKm: 5, description: "Cheap and easy, but a single run must stay under 100 m or the link will not come up." },
+  fiber: { label: "Fiber (single-mode)", maxM: 10000, speed: "10 Gbit/s", latencyPerKm: 5, description: "Glass. Runs for kilometres and ignores electrical noise. Needs optics on both ends." },
+};
+
+export interface LogEntry {
+  t: string; // in-game clock
+  text: string;
+  kind: "info" | "warn" | "error";
 }
 
 export interface NetworkSnapshot {
@@ -185,6 +204,7 @@ export function createDevice(kind: DeviceKind, id: string, name: string, buildin
     id: `${id}:${p}`,
     name: p,
     deviceId: id,
+    mac: macFor(`${id}:${p}`),
     mode: cat.l3 ? (kind === "router" && p === "wan" ? "dhcp" : "static") : "none",
   }));
   if (kind === "server") {
@@ -200,4 +220,15 @@ export function isRouterKind(kind: DeviceKind): boolean {
 
 export function isHostKind(kind: DeviceKind): boolean {
   return CATALOG[kind].l3 && !CATALOG[kind].routes;
+}
+
+/** Deterministic locally-administered MAC address derived from an interface id. */
+export function macFor(seed: string): string {
+  let h = 2166136261;
+  for (let i = 0; i < seed.length; i++) {
+    h ^= seed.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  const bytes = [0x02, 0x4d, 0x48, (h >>> 16) & 255, (h >>> 8) & 255, h & 255];
+  return bytes.map((b) => b.toString(16).padStart(2, "0")).join(":");
 }

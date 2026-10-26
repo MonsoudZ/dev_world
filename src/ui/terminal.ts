@@ -7,14 +7,23 @@ import { TraceResult } from "../net/sim";
 import { CATALOG } from "../net/model";
 
 const HELP = `Commands:
-  ip                 show this device's interfaces and addresses
+  ip                 show this device's interfaces, MAC and IP addresses
   ping <host>        send a request and wait for the reply (host = name or address)
-  trace <host>       show every hop a packet takes, and where it stops
+  trace <host>       show every hop a packet takes, with latency, and where it stops
   nslookup <name>    ask the DNS server for a name
   curl <url>         fetch a web page, e.g. curl http://learn.example
   route              show the routing table
-  neighbors          list devices reachable on the local network
-  clear              clear the screen`;
+  arp                show the ARP cache (IP → MAC of neighbours on the local network)
+  dhcp               replay the DHCP conversation for this host (DISCOVER/OFFER/REQUEST/ACK)
+  log                show this device's event log
+  clear              clear the screen
+Tab completes commands, device names, hostnames and addresses.`;
+
+const SWITCH_HELP = `Switch console:
+  show mac-address-table   which MAC addresses were learned on which port
+  show interfaces          port status, speed and what is plugged in
+  log                      event log
+  clear`;
 
 export class Terminal {
   root: HTMLElement;
@@ -58,7 +67,7 @@ export class Terminal {
       this.out,
       el("div", { class: "term-line" }, el("span", { class: "prompt" }, "$"), this.input)
     );
-    this.print(`Welcome to ${dev.name}. Type help for commands.`, "muted");
+    this.print(dev.kind === "switch" ? `${dev.name} console. Type help for commands.` : `Welcome to ${dev.name}. Type help for commands.`, "muted");
   }
 
   private get dev() {
@@ -69,7 +78,7 @@ export class Terminal {
   private complete() {
     const v = this.input.value;
     const parts = v.split(/\s+/);
-    const commands = ["help", "ip", "ping", "trace", "nslookup", "curl", "route", "neighbors", "clear"];
+    const commands = this.dev.kind === "switch" ? ["help", "show mac-address-table", "show interfaces", "log", "clear"] : ["help", "ip", "ping", "trace", "nslookup", "curl", "route", "arp", "dhcp", "log", "clear"];
     let pool: string[];
     if (parts.length <= 1) pool = commands;
     else {
@@ -145,7 +154,8 @@ export class Terminal {
       const name = dev?.name ?? h.deviceId;
       const via = h.via.length ? ` via ${h.via.map((v) => this.game.net.device(v)?.name ?? v).join(", ")}` : "";
       const out = h.ifaceOut ? ` ${this.game.net.iface(h.ifaceOut)?.name ?? ""}` : "";
-      this.print(`  ${idx + 1}. ${h.ok ? "●" : "✖"} ${name}${out}: ${h.action}${via}${h.detail ? `\n       ${h.detail}` : ""}`, h.ok ? "" : "bad");
+      const arp = h.arp ? `\n       ARP: who has ${h.arp.ip}? → ${h.arp.mac} (${h.arp.device})` : "";
+      this.print(`  ${idx + 1}. ${h.ok ? "●" : "✖"} ${name}${out}: ${h.action}${via}  [${h.atMs.toFixed(2)} ms]${arp}${h.detail ? `\n       ${h.detail}` : ""}`, h.ok ? "" : "bad");
     });
     if (!t.ok && t.hint) this.print(`  hint: ${t.hint}`, "hint");
   }
@@ -156,11 +166,31 @@ export class Terminal {
     this.print(`$ ${cmdline}`, "cmd");
     const [cmd, ...args] = cmdline.split(/\s+/);
     const arg = args.join(" ");
+    if (dev.kind === "switch") return this.runSwitch(cmd.toLowerCase(), args);
     switch (cmd.toLowerCase()) {
       case "help":
       case "?":
         this.print(HELP, "muted");
         break;
+      case "log":
+      case "logs":
+        this.printLog();
+        break;
+      case "dhcp": {
+        if (!dev.power) return this.print("device is powered off", "bad");
+        for (const st of g.net.dhcpTransaction(dev.id)) this.print(`${st.label.padEnd(9)} ${st.text}`, st.ok ? (st.label === "ACK" ? "good" : "") : "bad");
+        g.flags.add(`dhcp:${dev.id}`);
+        break;
+      }
+      case "arp": {
+        if (!dev.power) return this.print("device is powered off", "bad");
+        const t = g.net.arpTable(dev.id);
+        if (!t.length) return this.print("ARP cache is empty (no address, or no neighbours on this network).", "muted");
+        this.print("Address          HW address         Interface  Device");
+        for (const e of t) this.print(`${e.ip.padEnd(16)} ${e.mac}  ${e.iface.padEnd(9)}  ${e.device}`);
+        g.flags.add(`arp:${dev.id}`);
+        break;
+      }
       case "clear":
         this.out.innerHTML = "";
         break;
@@ -171,7 +201,7 @@ export class Terminal {
         for (const i of dev.ifaces) {
           const st = g.net.linkState(i);
           const e = g.net.effective(i);
-          this.print(`${i.name.padEnd(6)} link ${st.padEnd(5)} ${g.net.describeIface(i)}${e?.dns !== undefined ? ` dns ${ipToStr(e.dns)}` : ""}${g.net.conflicts.has(i.id) ? "  ⚠ DUPLICATE ADDRESS" : ""}`);
+          this.print(`${i.name.padEnd(6)} ${i.mac}  link ${st.padEnd(5)} ${g.net.describeIface(i)}${e?.dns !== undefined ? ` dns ${ipToStr(e.dns)}` : ""}${g.net.conflicts.has(i.id) ? "  ⚠ DUPLICATE ADDRESS" : ""}`);
         }
         break;
       case "route":
@@ -219,7 +249,7 @@ export class Terminal {
           return;
         }
         if (r.note) this.print(r.note, "muted");
-        const p = g.net.ping(dev.id, r.ip);
+        const p = g.net.ping(dev.id, r.ip, false);
         g.flags.add(`ping:${dev.id}:${r.ip}`);
         if (p.request) {
           this.printTrace(p.request, `Request to ${r.ip}`);
@@ -253,7 +283,7 @@ export class Terminal {
         const t = g.net.forward(dev.id, parseIp(r.ip)!, "icmp", { nat: new Map(), reply: false });
         this.printTrace(t, `Path to ${r.ip}`);
         this.animate(t, t.ok ? "rgb(255,210,80)" : "rgb(255,90,90)");
-        this.print(t.ok ? `reached ${g.net.device(t.deliveredTo!)?.name} in ${t.hops.length - 1} hop(s)` : `✖ stopped: ${t.reason}`, t.ok ? "good" : "bad");
+        this.print(t.ok ? `reached ${g.net.device(t.deliveredTo!)?.name} in ${t.hops.length - 1} hop(s), one-way ${t.rttMs.toFixed(2)} ms` : `✖ stopped: ${t.reason}`, t.ok ? "good" : "bad");
         break;
       }
       case "nslookup":
@@ -261,7 +291,7 @@ export class Terminal {
       case "host": {
         if (!arg) return this.print("usage: nslookup <name>", "muted");
         if (!dev.power) return this.print("device is powered off", "bad");
-        const r = g.net.resolve(dev.id, arg);
+        const r = g.net.resolve(dev.id, arg, false);
         g.flags.add(`nslookup:${dev.id}`);
         if (r.trace) this.animate(r.trace, r.ok ? "rgb(180,140,255)" : "rgb(255,90,90)");
         if (r.ok) {
@@ -281,7 +311,7 @@ export class Terminal {
         if (!dev.power) return this.print("device is powered off", "bad");
         const host = arg.replace(/^https?:\/\//, "").split("/")[0].toLowerCase();
         g.flags.add(`fetch:${dev.id}:${host}`);
-        const f = g.net.fetch(dev.id, arg);
+        const f = g.net.fetch(dev.id, arg, false);
         if (f.resolve?.trace) this.animate(f.resolve.trace, "rgb(180,140,255)");
         if (f.resolve && f.resolve.ok && parseIp(host) === null) this.print(`resolved ${host} → ${f.resolve.ip}`, "muted");
         if (f.request) {
@@ -292,7 +322,8 @@ export class Terminal {
         if (f.ok) {
           g.flags.add(`fetchok:${dev.id}:${host}`);
           setTimeout(() => this.animate(f.reply!, "rgb(80,230,170)"), 1600);
-          this.print(`HTTP/1.1 200 OK\n<title>${f.title}</title>`, "good");
+          this.print(`${(f.headers ?? ["HTTP/1.1 200 OK"]).join("\n")}\n\n<title>${f.title}</title>`, "good");
+          this.print(`total time: ${f.totalMs?.toFixed(2)} ms (DNS + TCP handshake + request)`, "muted");
         } else {
           this.print(`✖ ${f.reason}`, "bad");
           if (f.hint) this.print(`  hint: ${f.hint}`, "hint");
@@ -302,5 +333,47 @@ export class Terminal {
       default:
         this.print(`unknown command: ${cmd}. Type help.`, "bad");
     }
+  }
+
+  private printLog() {
+    const entries = this.dev.log ?? [];
+    if (!entries.length) return this.print("log is empty", "muted");
+    for (const e of entries.slice(-30)) this.print(`${e.t}  ${e.text}`, e.kind === "error" ? "bad" : e.kind === "warn" ? "hint" : "");
+  }
+
+  private runSwitch(cmd: string, args: string[]) {
+    const g = this.game;
+    const dev = this.dev;
+    const sub = args.join(" ").toLowerCase();
+    if (cmd === "help" || cmd === "?") return this.print(SWITCH_HELP, "muted");
+    if (cmd === "clear") {
+      this.out.innerHTML = "";
+      return;
+    }
+    if (cmd === "log" || cmd === "logs") return this.printLog();
+    if (!dev.power) return this.print("switch is powered off", "bad");
+    if (g.net.isBooting(dev)) return this.print("switch is booting…", "bad");
+    if ((cmd === "show" && sub.startsWith("mac")) || cmd === "mac") {
+      const table = g.net.macTable(dev.id);
+      if (!table.length) return this.print("MAC address table is empty: no live links.", "muted");
+      this.print("Port   MAC address        Learned from");
+      for (const row of table) {
+        if (!row.entries.length) this.print(`${row.port.padEnd(6)} (nothing heard yet)`);
+        for (const e of row.entries) this.print(`${row.port.padEnd(6)} ${e.mac}  ${e.device} ${e.iface}${e.ip ? ` (${e.ip})` : ""}`);
+      }
+      this.print("A switch learns which address sits behind each port by watching source addresses of frames. It never looks at IP.", "muted");
+      g.flags.add(`mactable:${dev.id}`);
+      return;
+    }
+    if ((cmd === "show" && sub.startsWith("int")) || cmd === "interfaces") {
+      for (const p of dev.ifaces) {
+        const st = g.net.linkState(p);
+        const peer = g.net.peerIface(p.id);
+        const link = g.net.linkOf(p.id);
+        this.print(`${p.name.padEnd(4)} ${st.padEnd(5)} ${link ? g.net.linkSpeed(link).padEnd(10) : "".padEnd(10)} ${peer ? `${g.net.device(peer.deviceId)?.name} ${peer.name}` : "empty"}${link && g.net.linkIssue(link) ? `  ✖ ${g.net.linkIssue(link)}` : ""}`, st === "down" ? "bad" : "");
+      }
+      return;
+    }
+    this.print(`unknown command: ${cmd}. Type help.`, "bad");
   }
 }

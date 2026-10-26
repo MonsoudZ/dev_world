@@ -41,7 +41,12 @@ export function seedWorld(net: Network) {
   wan.ip = "198.51.100.1";
   wan.prefix = 24;
   wan.locked = true;
-  net.connect(wan.id, cloud.ifaces[0].id);
+  const uplink = net.connect(wan.id, cloud.ifaces[0].id);
+  if (typeof uplink !== "string") {
+    uplink.medium = "fiber";
+    uplink.lengthM = 12000;
+    uplink.latencyMs = 8.5; // the provider's network between the modem and the wider internet
+  }
 
   net.addDevice("pc", "workshop", "Rosa-PC", "ws_pc");
   net.addDevice("laptop", "workshop", "Rosa-Laptop", "ws_laptop");
@@ -292,15 +297,16 @@ export const LESSONS: Lesson[] = [
     id: "links",
     title: "Link lights",
     concept: "Cables, ports and switches",
-    note: "A cable between two ports makes a link. Both ends must be powered for the link to come up (green). A switch joins many devices into one local network and forwards frames by hardware (MAC) address; it does not understand IP addresses at all.",
+    note: "A cable between two ports makes a link. Both ends must be powered for the link to come up (green); copper runs stop working past 100 m, fiber goes for kilometres. A switch joins many devices into one local network, learns which MAC address sits behind each port (show mac-address-table) and forwards frames by that; it does not understand IP addresses at all.",
     steps: [
       info(
         "Cables and links",
-        "Every network starts with something physical. A cable joins two ports; when both devices are on, the link comes up and the port shows green. A switch has many ports and joins everything plugged into it into one local network. In the workspace, select a device, find a port and press Connect."
+        "Every network starts with something physical. A cable joins two ports; when both devices are on, the link comes up and the port shows green. Copper cable is cheap but a single run must stay under 100 m; longer runs need fiber. A switch has many ports and joins everything plugged into it into one local network. In the workspace, select a device, find a port and press Connect."
       ),
       task("Connect Rosa-PC to the switch", "Select Rosa-PC, press Connect on its eth0 port, and pick any port on Workshop-SW.", (g) => linkedTo(g, "ws_pc", "eth0", "ws_switch"), "Rosa-PC → eth0 → Connect → Workshop-SW p1.", "workshop"),
       task("Connect Rosa-Laptop to the switch", "Same again for the laptop.", (g) => linkedTo(g, "ws_laptop", "eth0", "ws_switch") && linkedTo(g, "ws_pc", "eth0", "ws_switch"), undefined, "workshop", (g) => [linkItem(g, "ws_pc", "eth0", "ws_switch", "Rosa-PC ↔ Workshop-SW"), linkItem(g, "ws_laptop", "eth0", "ws_switch", "Rosa-Laptop ↔ Workshop-SW")]),
       info("Two green lights", "Both links are up. The switch now carries one small local network with two devices on it. Notice the switch's ports have no address fields: a switch works below IP, forwarding frames by hardware address."),
+      task("Look inside the switch", "Select Workshop-SW and in its console run: show mac-address-table. Each port lists the hardware (MAC) addresses the switch has learned behind it.", (g) => hasFlag(g, "mactable:ws_switch"), "Switches have a console too. Type help there.", "workshop"),
       quiz("What does a switch use to decide where to send a frame?", ["The IP address", "The hardware (MAC) address", "The colour of the cable", "The device's name"], 1, "Switches learn which hardware address sits behind each port and forward frames accordingly. IP addresses are a layer above and belong to routers and hosts."),
       talk("Rosa", "Now open the terminal on Rosa-PC and type: ping Rosa-Laptop. Read what comes back carefully. I don't expect it to work yet."),
       task("Try a ping", "In Rosa-PC's terminal run: ping Rosa-Laptop", (g) => hasFlag(g, "ping:ws_pc"), "Select Rosa-PC; the terminal is on the right side of the workspace.", "workshop"),
@@ -311,7 +317,7 @@ export const LESSONS: Lesson[] = [
     id: "addresses",
     title: "Addresses",
     concept: "IP addresses and subnets",
-    note: "An IP address (192.168.1.10) plus a mask (/24) names a host and the network it belongs to. Two hosts can talk directly only when the network part matches. If it doesn't, the host needs a router (a default gateway) to pass the packet along.",
+    note: "An IP address (192.168.1.10) plus a mask (/24) names a host and the network it belongs to. Two hosts can talk directly only when the network part matches; the sender first uses ARP to turn the neighbour's IP into a MAC address. If the network part differs, the host needs a router (a default gateway) to pass the packet along.",
     steps: [
       info(
         "IP addresses and subnets",
@@ -319,7 +325,7 @@ export const LESSONS: Lesson[] = [
       ),
       task("Address Rosa-PC", "Select Rosa-PC → eth0 → set Static, IP 192.168.1.10, mask /24. Apply.", (g) => addrIs(g, "ws_pc", "192.168.1.10", 24), "Mask /24 is the same as 255.255.255.0.", "workshop"),
       task("Address Rosa-Laptop", "Give Rosa-Laptop 192.168.1.11 /24.", (g) => addrIs(g, "ws_laptop", "192.168.1.11", 24) && addrIs(g, "ws_pc", "192.168.1.10", 24), undefined, "workshop"),
-      task("Ping across the switch", "From Rosa-PC: ping 192.168.1.11 (or ping Rosa-Laptop). It should answer now.", (g) => hasFlag(g, "pingok:ws_pc"), "Both hosts are in network 192.168.1.0/24, so the PC sends the packet straight to the laptop through the switch.", "workshop"),
+      task("Ping across the switch", "From Rosa-PC: ping 192.168.1.11 (or ping Rosa-Laptop). It should answer now. Notice the ARP line: before the first packet, the PC asked \"who has 192.168.1.11?\" and learned the laptop's MAC address.", (g) => hasFlag(g, "pingok:ws_pc"), "Both hosts are in network 192.168.1.0/24, so the PC sends the packet straight to the laptop through the switch. Run arp afterwards to see the cache.", "workshop"),
       talk("Rosa", "Good. Now break it on purpose: change the laptop to 192.168.2.11 /24 and ping it again from the PC."),
       predict("Before you do: Rosa-Laptop moves to 192.168.2.11/24, Rosa-PC stays on 192.168.1.10/24, same switch, same cables. What will the ping do?", ["Work exactly as before; the switch connects them", "Fail: they are now on different networks and nothing routes between them", "Work, but slower"], "Make the change and ping. Then compare what happened with what you predicted."),
       task("Experiment: a different network", "Set Rosa-Laptop to 192.168.2.11 /24, then ping it from Rosa-PC and read the trace.", (g) => addrIs(g, "ws_laptop", "192.168.2.11") && hasFlag(g, "pingfail:ws_pc"), "The address changed, the cable did not. Watch where the packet dies.", "workshop"),
@@ -419,6 +425,7 @@ export const LESSONS: Lesson[] = [
         const i = g.net.device(id)!.ifaces[0];
         return { label: `${g.net.device(id)!.name}: ${i.lease ? "lease " + i.lease.ip : i.mode === "dhcp" ? "DHCP, no lease yet" : "still static"}`, done: i.mode === "dhcp" && !!i.lease };
       })),
+      task("Watch the handshake", "From Jun-Laptop run: dhcp. Read the four messages: DISCOVER, OFFER, REQUEST, ACK.", (g) => hasFlag(g, "dhcp:jun_laptop"), undefined, "house_jun"),
       task("Try it from Jun's room", "From Jun-Laptop: curl http://learn.example", (g) => hasFlag(g, "fetchok:jun_laptop:learn.example"), undefined, "house_jun"),
       talk("Theo", "Neat trick, that DHCP. I wrote down the first address I saw on your router and typed it into my laptop myself. Static is more reliable, right?", "house_theo"),
       {
@@ -457,11 +464,11 @@ export const LESSONS: Lesson[] = [
         "Names and services",
         "People remember names, not numbers. DNS turns market.hollow into 192.168.1.20. A client asks its DNS server; a server that does not know a name can forward the question upstream (to 198.51.100.10). A web server answers HTTP on port 80 for the hostnames you tell it to serve."
       ),
-      task("Give the market a switch", "Workshop-SW is nearly full. Add a switch in the Corner Market, link it to Workshop-SW, connect Market-POS to it and set Market-POS to DHCP.", (g) => {
+      task("Give the market a switch", "Workshop-SW is nearly full. Add a switch in the Corner Market, link it to Workshop-SW, connect Market-POS to it and set Market-POS to DHCP. The market is about 135 m from the workshop by road: too far for copper, so choose fiber for that run.", (g) => {
         const sw = g.net.devicesIn("shop").find((d) => d.kind === "switch");
         const pos = g.net.device("shop_pc");
         return !!sw && !!pos && reachesRouterLan(g, "shop_pc") && pos.ifaces[0].mode === "dhcp" && !!pos.ifaces[0].lease;
-      }, "Add equipment → Switch, then cable: shop switch ↔ Workshop-SW (Another building…), Market-POS ↔ shop switch.", "shop", (g) => {
+      }, "Add equipment → Switch, then cable: shop switch ↔ Workshop-SW (Another building…, pick Fiber), Market-POS ↔ shop switch.", "shop", (g) => {
         const sw = g.net.devicesIn("shop").find((d) => d.kind === "switch");
         const pos = g.net.device("shop_pc")!;
         return [
@@ -512,14 +519,12 @@ export const LESSONS: Lesson[] = [
             return a && b && [a.buildingId, b.buildingId].sort().join() === ["library", "workshop"].join();
           });
           if (!target) target = [...g.net.links.values()].find((l) => g.net.ifaceDevice(l.a)?.buildingId !== g.net.ifaceDevice(l.b)?.buildingId && !g.net.ifaceDevice(l.a)?.hidden);
-          if (target) {
-            target.damaged = true;
-            g.net.touch();
-          }
+          if (target) g.net.setDamaged(target.id, true);
+          g.setRain(1, 150);
           g.toast("A cable was damaged in the storm.", "bad");
         },
       },
-      task("Find the break", "From Reading-Room-1 run: trace learn.example. Follow the hops, find the damaged cable (a red port, a red dashed line on the map) and replace it.", (g) => ![...g.net.links.values()].some((l) => l.damaged) && fetchOk(g, "lib_laptop1", "http://learn.example"), "In the workspace, a damaged port shows red. Press Replace cable on it.", "library"),
+      task("Find the break", "From Reading-Room-1 run: trace learn.example. Follow the hops, find the damaged cable (a red port, a red dashed line on the map) and replace it. The event log on Library-SW also records the moment the link went down.", (g) => ![...g.net.links.values()].some((l) => l.damaged) && fetchOk(g, "lib_laptop1", "http://learn.example"), "In the workspace, a damaged port shows red. Press Replace cable on it.", "library"),
       info("Bottom-up", "When something breaks, test the layers in order: physical (link up?), addressing (does the host have an address? any conflicts?), routing (can it reach the gateway?), names (does DNS answer?), service (is the server listening?). The trace tool shows which layer failed."),
       quiz("A user says 'the website is down'. What do you check first?", ["Reinstall the browser", "Link lights, then whether the host can ping its gateway", "Rewrite the DNS records", "Buy a new server"], 1, "Start at the bottom. Most outages are a cable, a power switch or an address, and those are also the quickest to confirm or rule out."),
     ],

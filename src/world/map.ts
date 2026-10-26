@@ -295,3 +295,15 @@ export function roadPath(from: { x: number; y: number }, to: { x: number; y: num
 export function lotCenter(b: Building): { x: number; y: number } {
   return { x: b.lot.x + b.lot.w / 2, y: b.lot.y + b.lot.h / 2 };
 }
+
+/** Physical scale of the town: one tile is this many metres. */
+export const TILE_METERS = 9;
+
+/** Estimated cable run between two buildings along the road, including the in-building runs. */
+export function cableLengthM(aId: string, bId: string): number {
+  if (aId === bId) return 5;
+  const a = building(aId);
+  const b = building(bId);
+  const path = roadPath(a.door, b.door);
+  return Math.round((path.length - 1) * TILE_METERS + 18);
+}

@@ -5,6 +5,7 @@ import { Network, TraceResult } from "../net/sim";
 import { DeviceKind, Device, NetworkSnapshot } from "../net/model";
 import { BUILDINGS, building, roadPath } from "../world/map";
 import { People } from "../world/people";
+import { Vehicles } from "../world/vehicles";
 import { BuildingVisual, CableVisual, PacketAnim, pathLength } from "../render/renderer";
 import { LESSONS, NEEDS, Need, Step, seedWorld } from "./campaign";
 
@@ -58,6 +59,10 @@ const SAVE_VERSION = 3;
 export class Game {
   net = new Network();
   people: People;
+  vehicles: Vehicles;
+  rain = 0; // current rain intensity 0..1
+  rainTarget = 0;
+  rainUntil = 0; // game time when the rain stops
   time = 0;
   dayFrac = 0.32;
   day = 1;
@@ -87,12 +92,27 @@ export class Game {
 
   constructor(public mode: Mode) {
     this.people = new People(() => this.onlineBuildings());
+    this.vehicles = new Vehicles(() => !!this.needStatus.get("shop_site")?.ok);
     if (!this.load()) this.newWorld();
+  }
+
+  private attachClock() {
+    this.net.setClock(
+      () => this.time,
+      () => `Day ${this.day} ${this.clockLabel()}`
+    );
+  }
+
+  /** Start rain that fades out after `seconds`. */
+  setRain(intensity: number, seconds = 90) {
+    this.rainTarget = intensity;
+    this.rainUntil = intensity > 0 ? this.time + seconds : 0;
   }
 
   // ------------------------------------------------------------- world setup
   newWorld() {
     this.net = new Network();
+    this.attachClock();
     seedWorld(this.net);
     this.progress = { lesson: 0, step: 0, completed: [], quizRight: 0, quizWrong: 0, finished: false };
     this.unlockedDevices = new Set(this.mode === "sandbox" ? ["pc", "laptop", "switch", "router", "server"] : ["switch"]);
@@ -142,6 +162,7 @@ export class Game {
       const data = JSON.parse(raw) as SaveFile;
       if (data.version !== SAVE_VERSION) return false;
       this.net = new Network();
+      this.attachClock();
       this.net.load(data.net);
       this.progress = data.progress;
       this.dayFrac = data.dayFrac;
@@ -169,7 +190,8 @@ export class Game {
     // 0 at midnight, 1 at midday. Smooth curve with long dusk/dawn.
     const f = this.dayFrac;
     const sun = Math.cos((f - 0.5) * Math.PI * 2); // 1 at noon (0.5), -1 at midnight
-    return Math.max(0, Math.min(1, (sun + 0.78) / 1.35));
+    const base = Math.max(0, Math.min(1, (sun + 0.78) / 1.35));
+    return base * (1 - 0.4 * this.rain);
   }
 
   clockLabel(): string {
@@ -190,6 +212,13 @@ export class Game {
       this.day++;
     }
     this.people.update(dt);
+    this.vehicles.update(dt);
+    if (this.rainUntil && this.time > this.rainUntil) this.rainTarget = 0;
+    this.rain += (this.rainTarget - this.rain) * Math.min(1, dt * 0.4);
+    if (this.net.tickBoots()) {
+      this.recompute();
+      this.events.emit("change", undefined);
+    }
     for (const p of this.packets) {
       if (p.done) continue;
       p.progress += p.speed * dt;
@@ -241,6 +270,7 @@ export class Game {
     this.rebuildCables();
     const online = this.onlineBuildings().length;
     this.people.target = 4 + online * 3;
+    this.vehicles.target = 2 + Math.floor(online / 2);
   }
 
   needActive(need: Need): boolean {
@@ -283,7 +313,7 @@ export class Game {
         unlocked,
         online: needs.length > 0 && needs.every((n) => n.status.ok),
         alert: unmet.length > 0,
-        powered: devices.some((d) => d.power && d.ifaces.some((i) => this.net.linkState(i) === "up")),
+        powered: devices.some((d) => this.net.isUp(d) && d.ifaces.some((i) => this.net.linkState(i) === "up")),
         summary,
       });
     }
@@ -306,8 +336,8 @@ export class Game {
       const n = seen.get(pairKey) ?? 0;
       seen.set(pairKey, n + 1);
       const points = roadPath(ba.door, bb.door);
-      const state: CableVisual["state"] = link.damaged ? "down" : da.power && db.power ? "up" : "idle";
-      out.push({ id: link.id, points, state, offset: (n % 2 === 0 ? 1 : -1) * Math.ceil(n / 2) * 0.5, label: `${da.name} ${a.name} ↔ ${db.name} ${b.name}` });
+      const state: CableVisual["state"] = this.net.linkIssue(link) ? "down" : this.net.isUp(da) && this.net.isUp(db) ? "up" : "idle";
+      out.push({ id: link.id, points, state, offset: (n % 2 === 0 ? 1 : -1) * Math.ceil(n / 2) * 0.5, label: `${da.name} ${a.name} ↔ ${db.name} ${b.name}`, medium: link.medium });
     }
     this.cables = out;
   }

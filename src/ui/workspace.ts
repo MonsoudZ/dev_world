@@ -2,10 +2,10 @@
 
 import { el } from "../core/events";
 import { Game } from "../game/game";
-import { CATALOG, Device, DeviceKind, Iface } from "../net/model";
+import { CATALOG, Device, DeviceKind, Iface, MEDIA, Medium } from "../net/model";
 import { ipToStr, parseIp } from "../net/ip";
 import { TraceResult } from "../net/sim";
-import { building } from "../world/map";
+import { building, cableLengthM } from "../world/map";
 import { Terminal } from "./terminal";
 
 export class Workspace {
@@ -13,6 +13,8 @@ export class Workspace {
   private selectedDevice: string | null = null;
   private terminals = new Map<string, Terminal>();
   private picker: { ifaceId: string } | null = null;
+  private mediumChoice: { ifaceId: string; targetId: string; lengthM: number } | null = null;
+  private showAllLogs = false;
 
   constructor(private game: Game, private host: HTMLElement) {
     this.root = el("div", { class: "ws-overlay hidden" });
@@ -81,7 +83,8 @@ export class Workspace {
       )
     );
     this.root.append(panel);
-    if (this.picker) this.root.append(this.renderPicker(this.picker.ifaceId));
+    if (this.mediumChoice) this.root.append(this.renderMediumChoice());
+    else if (this.picker) this.root.append(this.renderPicker(this.picker.ifaceId));
     else if (g.pendingCable && g.pendingCable.fromBuilding !== bid) this.root.append(this.renderPicker(g.pendingCable.ifaceId, true));
   }
 
@@ -129,6 +132,7 @@ export class Workspace {
       el("div", { class: "rack-head" }, el("h3", {}, "Rack"), el("span", { class: "muted small" }, `${devices.length}/${slots}`)),
       ...devices.map((d) => {
         const up = d.ifaces.some((i) => g.net.linkState(i) === "up");
+        const booting = g.net.isBooting(d);
         const conflict = d.ifaces.some((i) => g.net.conflicts.has(i.id));
         const addr = CATALOG[d.kind].l3 ? g.net.primaryAddr(d) : null;
         return el(
@@ -145,9 +149,9 @@ export class Workspace {
             "span",
             { class: "rack-text" },
             el("strong", {}, d.name),
-            el("span", { class: "muted small" }, CATALOG[d.kind].label + (addr ? ` · ${ipToStr(addr.ip)}` : CATALOG[d.kind].l3 && d.power ? " · no address" : ""))
+            el("span", { class: "muted small" }, CATALOG[d.kind].label + (booting ? " · booting…" : addr ? ` · ${ipToStr(addr.ip)}` : CATALOG[d.kind].l3 && d.power ? " · no address" : ""))
           ),
-          el("span", { class: `led ${!d.power ? "off" : conflict ? "red" : up ? "green" : "grey"}`, title: !d.power ? "powered off" : conflict ? "address conflict" : up ? "link up" : "no link" })
+          el("span", { class: `led ${!d.power ? "off" : booting ? "amber" : conflict ? "red" : up ? "green" : "grey"}`, title: !d.power ? "powered off" : booting ? "booting" : conflict ? "address conflict" : up ? "link up" : "no link" })
         );
       }),
       addSel,
@@ -181,9 +185,8 @@ export class Workspace {
           cb.checked = d.power;
           cb.disabled = !!d.fixed;
           cb.onchange = () => {
-            d.power = cb.checked;
-            g.net.touch();
-            g.toast(`${d.name} powered ${d.power ? "on" : "off"}.`);
+            g.net.setPower(d.id, cb.checked);
+            g.toast(cb.checked ? `${d.name} powering on, booting…` : `${d.name} powered off.`);
             g.recompute();
             g.save();
             this.render();
@@ -215,6 +218,7 @@ export class Workspace {
     if (cat.l3) for (const i of d.ifaces) sections.push(this.renderIfaceConfig(d, i));
     if (d.kind === "router") sections.push(this.renderRoutes(d), this.renderAcl(d));
     if (d.kind === "server") sections.push(this.renderServices(d));
+    sections.push(this.renderLog(d));
     return el("section", { class: "ws-detail" }, ...sections);
   }
 
@@ -233,11 +237,14 @@ export class Workspace {
           const peerDev = peer ? g.net.device(peer.deviceId) : undefined;
           const link = g.net.linkOf(i.id);
           const remote = peerDev && peerDev.buildingId !== d.buildingId && !peerDev.hidden ? ` (${building(peerDev.buildingId).name})` : "";
+          const issue = link ? g.net.linkIssue(link) : null;
+          const media = link && !peerDev?.hidden ? ` · ${link.medium} ${link.lengthM} m` : "";
+          const farOff = peerDev && !g.net.isUp(peerDev) ? (g.net.isBooting(peerDev) ? " · far end booting" : " · far end is off") : "";
           return el(
             "div",
             { class: `port ${st}` },
             el("span", { class: `led ${st === "up" ? "green" : st === "down" ? "red" : "grey"}` }),
-            el("div", { class: "grow" }, el("strong", {}, i.name), el("div", { class: "muted small" }, peerDev ? `→ ${peerDev.name} ${peer!.name}${remote}${link?.damaged ? " · DAMAGED" : st === "down" ? " · far end is off" : ""}` : "empty")),
+            el("div", { class: "grow" }, el("strong", {}, i.name, el("span", { class: "mac" }, i.mac)), el("div", { class: "muted small" }, peerDev ? `→ ${peerDev.name} ${peer!.name}${remote}${media}${issue ? ` · NO LINK: ${issue}` : farOff}` : "empty")),
             !i.linkId
               ? el("button", { class: "btn small", onclick: () => this.startConnect(i) }, "Connect")
               : el(
@@ -249,8 +256,7 @@ export class Workspace {
                         {
                           class: "btn small good",
                           onclick: () => {
-                            link.damaged = false;
-                            g.net.touch();
+                            g.net.setDamaged(link.id, false);
                             g.toast("Cable replaced.", "good");
                             g.recompute();
                             g.save();
@@ -265,8 +271,7 @@ export class Workspace {
                           {
                             class: "btn small ghost",
                             onclick: () => {
-                              link!.damaged = true;
-                              g.net.touch();
+                              g.net.setDamaged(link!.id, true);
                               g.recompute();
                               g.save();
                               this.render();
@@ -338,17 +343,13 @@ export class Workspace {
                   {
                     class: "btn small",
                     onclick: () => {
-                      const r = g.net.connect(ifaceId, p.id);
-                      if (typeof r === "string") g.toast(r, "bad");
-                      else {
-                        g.toast(`Connected ${srcDev.name} ${src.name} ↔ ${grp.d.name} ${p.name}.`, "good");
-                        g.flags.add(`connect:${srcDev.id}:${grp.d.id}`);
+                      if (srcDev.buildingId !== grp.d.buildingId) {
+                        this.mediumChoice = { ifaceId, targetId: p.id, lengthM: cableLengthM(srcDev.buildingId, grp.d.buildingId) };
+                        this.picker = null;
+                        this.render();
+                        return;
                       }
-                      this.picker = null;
-                      g.pendingCable = undefined;
-                      g.recompute();
-                      g.save();
-                      this.render();
+                      this.finishConnect(ifaceId, p.id, "copper", 3);
                     },
                   },
                   p.name
@@ -374,6 +375,71 @@ export class Workspace {
             ),
         el("button", { class: "btn ghost", onclick: closePicker }, "Cancel")
       )
+    );
+  }
+
+  private finishConnect(ifaceId: string, targetId: string, medium: Medium, lengthM: number) {
+    const g = this.game;
+    const src = g.net.iface(ifaceId)!;
+    const srcDev = g.net.device(src.deviceId)!;
+    const tgt = g.net.iface(targetId)!;
+    const tgtDev = g.net.device(tgt.deviceId)!;
+    const r = g.net.connect(ifaceId, targetId, { medium, lengthM });
+    if (typeof r === "string") g.toast(r, "bad");
+    else {
+      const issue = g.net.linkIssue(r);
+      g.toast(issue ? `Cable connected, but no link: ${issue}.` : `Connected ${srcDev.name} ${src.name} ↔ ${tgtDev.name} ${tgt.name} (${MEDIA[medium].label}, ${lengthM} m).`, issue ? "bad" : "good");
+      g.flags.add(`connect:${srcDev.id}:${tgtDev.id}`);
+    }
+    this.picker = null;
+    this.mediumChoice = null;
+    g.pendingCable = undefined;
+    g.recompute();
+    g.save();
+    this.render();
+  }
+
+  private renderMediumChoice() {
+    const g = this.game;
+    const mc = this.mediumChoice!;
+    const src = g.net.iface(mc.ifaceId)!;
+    const tgt = g.net.iface(mc.targetId)!;
+    const from = building(g.net.device(src.deviceId)!.buildingId);
+    const to = building(g.net.device(tgt.deviceId)!.buildingId);
+    const options = (Object.keys(MEDIA) as Medium[]).map((m) => {
+      const spec = MEDIA[m];
+      const fits = mc.lengthM <= spec.maxM;
+      return el(
+        "button",
+        { class: `medium-opt ${fits ? "" : "bad"}`, onclick: () => this.finishConnect(mc.ifaceId, mc.targetId, m, mc.lengthM) },
+        el("div", { class: "row between" }, el("strong", {}, spec.label), el("span", { class: fits ? "good" : "bad" }, fits ? "✓ reaches" : `✖ max ${spec.maxM} m`)),
+        el("div", { class: "muted small" }, `${spec.speed} · ${spec.description}`)
+      );
+    });
+    return el(
+      "div",
+      { class: "picker-overlay" },
+      el(
+        "div",
+        { class: "picker" },
+        el("h3", {}, "Choose the cable"),
+        el("p", { class: "muted" }, `${from.name} → ${to.name} is about ${mc.lengthM} m along the road. Pick a medium for the run:`),
+        ...options,
+        el("button", { class: "btn ghost", onclick: () => { this.mediumChoice = null; g.pendingCable = undefined; this.render(); } }, "Cancel")
+      )
+    );
+  }
+
+  private renderLog(d: Device) {
+    const g = this.game;
+    const entries = [...(d.log ?? [])].reverse();
+    const shown = this.showAllLogs ? entries : entries.slice(0, 8);
+    return el(
+      "div",
+      { class: "card" },
+      el("div", { class: "row between" }, el("h4", {}, "Event log"), entries.length > 8 ? el("button", { class: "btn tiny ghost", onclick: () => { this.showAllLogs = !this.showAllLogs; this.render(); } }, this.showAllLogs ? "Show less" : `Show all ${entries.length}`) : null),
+      entries.length === 0 ? el("p", { class: "muted small" }, "Nothing logged yet.") : el("div", { class: "logs" }, ...shown.map((e) => el("div", { class: `log-line ${e.kind}` }, el("span", { class: "log-t" }, e.t), el("span", {}, e.text)))),
+      g.mode === "sandbox" && entries.length ? el("button", { class: "btn tiny ghost", onclick: () => { d.log = []; this.render(); } }, "Clear") : null
     );
   }
 
@@ -438,7 +504,7 @@ export class Workspace {
       "Apply"
     );
     const dhcpServer = d.kind === "router" && i.name !== "wan" ? this.renderDhcpServer(d, i) : null;
-    return el("div", { class: "card" }, el("h4", {}, `Interface ${i.name}`), status, el("label", {}, "Address mode", modeSel), staticFields, natRow, apply, dhcpServer);
+    return el("div", { class: "card" }, el("h4", {}, `Interface ${i.name}`, el("span", { class: "mac" }, i.mac)), status, el("label", {}, "Address mode", modeSel), staticFields, natRow, apply, dhcpServer);
   }
 
   private renderDhcpServer(d: Device, i: Iface) {
@@ -624,7 +690,6 @@ export class Workspace {
 
   // ------------------------------------------------------------------ terminal
   private renderTerminal(d: Device) {
-    if (d.kind === "switch") return el("section", { class: "ws-term" }, el("div", { class: "term-head" }, "Terminal"), el("p", { class: "muted small pad" }, "Switches have no console in this town. They forward frames and ask nothing of you."));
     let t = this.terminals.get(d.id);
     if (!t) {
       t = new Terminal(this.game, d.id, (trace, color) => this.game.animateTrace(trace, color));

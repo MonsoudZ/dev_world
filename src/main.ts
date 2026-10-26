@@ -210,6 +210,11 @@ function frame(now: number) {
       const pos = game.people.position(p);
       return { x: pos.x, y: pos.y, color: p.color, skin: p.skin, phase: personPhase * p.speed + p.id };
     }),
+    vehicles: game.vehicles.list.map((v) => {
+      const pos = game.vehicles.position(v);
+      return { ...pos, color: v.color, kind: v.kind };
+    }),
+    rain: game.rain,
     selected: game.selected,
     hoverBuilding: game.workspace ? undefined : hover,
     mouse,

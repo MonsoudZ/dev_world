@@ -5,6 +5,7 @@
 import { Camera } from "./camera";
 import { BUILDINGS, Building, DECORATIONS, MAP_H, MAP_W, TILES, Tile, roadPath, building } from "../world/map";
 import { hash, clamp } from "../core/events";
+import { Medium } from "../net/model";
 
 export interface BuildingVisual {
   unlocked: boolean;
@@ -20,6 +21,16 @@ export interface CableVisual {
   state: "up" | "down" | "idle";
   offset: number;
   label: string;
+  medium: Medium;
+}
+
+export interface VehicleVisual {
+  x: number;
+  y: number;
+  dx: number;
+  dy: number;
+  color: string;
+  kind: "car" | "van";
 }
 
 export interface PacketAnim {
@@ -52,6 +63,8 @@ export interface RenderState {
   cables: CableVisual[];
   packets: PacketAnim[];
   people: PersonVisual[];
+  vehicles: VehicleVisual[];
+  rain: number;
   selected?: string;
   hoverBuilding?: string;
   mouse?: { x: number; y: number };
@@ -163,6 +176,7 @@ export class Renderer {
     this.drawEntities(s);
     if (s.showTraffic) this.drawPackets(s);
     this.drawNight(s);
+    this.drawRain(s);
     this.drawLabels(s);
     c.setTransform(1, 0, 0, 1, 0, 0);
   }
@@ -326,7 +340,8 @@ export class Renderer {
     this.strokePath(fiber, "rgba(0,0,0,0.3)", 4 * cam.zoom, undefined, -0.3);
     this.strokePath(fiber, "rgba(255,150,40,0.9)", 2.2 * cam.zoom, [8 * cam.zoom, 5 * cam.zoom], -0.3);
     for (const cab of s.cables) {
-      const color = cab.state === "up" ? "rgba(60,230,170,0.95)" : cab.state === "down" ? "rgba(255,80,80,0.95)" : "rgba(200,200,210,0.8)";
+      const upColor = cab.medium === "fiber" ? "rgba(255,190,70,0.95)" : "rgba(60,230,170,0.95)";
+      const color = cab.state === "up" ? upColor : cab.state === "down" ? "rgba(255,80,80,0.95)" : "rgba(200,200,210,0.8)";
       const pts = cab.points.map((p) => ({ x: p.x + 0.5, y: p.y + 0.5 }));
       this.strokePath(pts, "rgba(0,0,0,0.35)", 4.5 * cam.zoom, undefined, cab.offset);
       this.strokePath(pts, color, 2.4 * cam.zoom, cab.state === "down" ? [5 * cam.zoom, 5 * cam.zoom] : undefined, cab.offset);
@@ -355,7 +370,7 @@ export class Renderer {
         c.font = `bold ${10 * cam.zoom}px Inter, sans-serif`;
         c.textAlign = "center";
         c.fillStyle = "#ff6b6b";
-        c.fillText("DAMAGED", mp.x, mp.y - 16 * cam.zoom);
+        c.fillText("NO LINK", mp.x, mp.y - 16 * cam.zoom);
       }
     }
   }
@@ -387,6 +402,7 @@ export class Renderer {
     }
     for (const d of DECORATIONS) ents.push({ key: d.x + d.y + 1.2, draw: () => this.drawDecoration(d.kind, d.x, d.y, s) });
     for (const p of s.people) ents.push({ key: p.x + p.y + 0.6, draw: () => this.drawPerson(p, s) });
+    for (const v of s.vehicles) ents.push({ key: v.x + v.y + 0.5, draw: () => this.drawVehicle(v, s) });
     ents.sort((a, b) => a.key - b.key);
     for (const e of ents) e.draw();
   }
@@ -870,6 +886,65 @@ export class Renderer {
     c.beginPath();
     c.arc(sp.x, sp.y - 15 * z - bob, 3 * z, 0, Math.PI * 2);
     c.fill();
+  }
+
+  private drawVehicle(v: VehicleVisual, s: RenderState) {
+    const c = this.ctx;
+    const cam = this.cam;
+    const z = cam.zoom;
+    const alongX = v.dx !== 0;
+    const w = alongX ? (v.kind === "van" ? 0.6 : 0.5) : 0.28;
+    const d = alongX ? 0.28 : v.kind === "van" ? 0.6 : 0.5;
+    const x0 = v.x - w / 2;
+    const y0 = v.y - d / 2;
+    const h = v.kind === "van" ? 12 : 8;
+    const mix = (col: string) => this.nightMix(col, s.light);
+    // shadow
+    this.poly(c, this.rect(x0 + 0.05, y0 + 0.05, x0 + w + 0.08, y0 + d + 0.08), "rgba(0,0,0,0.25)");
+    this.box(x0, y0, w, d, 0, h, mix(v.color), mix(this.shade(v.color, 0.75)), mix(this.shade(v.color, 0.6)));
+    // cabin / windows
+    const cab = v.kind === "van" ? 0.35 : 0.55;
+    const cx0 = alongX ? x0 + w * (v.dx > 0 ? 0.45 : 0.1) : x0 + 0.03;
+    const cy0 = alongX ? y0 + 0.03 : y0 + d * (v.dy > 0 ? 0.45 : 0.1);
+    const cw = alongX ? w * cab * 0.8 : w - 0.06;
+    const cd = alongX ? d - 0.06 : d * cab * 0.8;
+    this.box(cx0, cy0, cw, cd, h, 5, mix("#90caf9"), mix("#5d8fb8"), mix("#4a7398"));
+    // headlights at night
+    if (s.light < 0.45) {
+      const fx = alongX ? (v.dx > 0 ? x0 + w : x0) : v.x;
+      const fy = alongX ? v.y : v.dy > 0 ? y0 + d : y0;
+      const p = cam.toScreen(fx, fy, 3);
+      const g = c.createRadialGradient(p.x, p.y, 0, p.x, p.y, 22 * z);
+      g.addColorStop(0, "rgba(255,245,200,0.45)");
+      g.addColorStop(1, "rgba(255,245,200,0)");
+      c.fillStyle = g;
+      c.beginPath();
+      c.ellipse(p.x + (alongX ? v.dx : -v.dy) * 12 * z, p.y + (alongX ? v.dx : v.dy) * 6 * z, 24 * z, 12 * z, 0, 0, Math.PI * 2);
+      c.fill();
+      c.fillStyle = "#fff8d6";
+      c.beginPath();
+      c.arc(p.x, p.y, 1.6 * z, 0, Math.PI * 2);
+      c.fill();
+    }
+  }
+
+  private drawRain(s: RenderState) {
+    if (s.rain <= 0.02) return;
+    const c = this.ctx;
+    const cam = this.cam;
+    c.fillStyle = `rgba(40,50,80,${0.18 * s.rain})`;
+    c.fillRect(0, 0, cam.width, cam.height);
+    c.strokeStyle = `rgba(200,220,255,${0.35 * s.rain})`;
+    c.lineWidth = 1;
+    const n = Math.floor(160 * s.rain);
+    c.beginPath();
+    for (let i = 0; i < n; i++) {
+      const x = ((hash(i, 3, 77) * cam.width + s.time * 60 * (0.6 + hash(i, 4, 77))) % (cam.width + 40)) - 20;
+      const y = (hash(i, 5, 77) * cam.height + s.time * (420 + hash(i, 6, 77) * 240)) % (cam.height + 30);
+      c.moveTo(x, y);
+      c.lineTo(x - 3, y + 11 + hash(i, 7, 77) * 6);
+    }
+    c.stroke();
   }
 
   private drawPackets(s: RenderState) {

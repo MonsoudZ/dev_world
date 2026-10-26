@@ -471,6 +471,19 @@ export class Panels {
         },
         "📈 Traffic burst"
       ),
+      el(
+        "button",
+        {
+          class: "btn small",
+          onclick: () => {
+            if (g.rainTarget > 0) g.setRain(0);
+            else g.setRain(1, 600);
+            g.toast(g.rainTarget > 0 ? "Rain moving in." : "Clearing up.");
+            this.renderSandbox();
+          },
+        },
+        g.rainTarget > 0 ? "☀ Clear weather" : "🌧 Make it rain"
+      ),
       el("button", { class: "btn small ghost", onclick: () => this.showNotes() }, "📓 Field notes")
     );
   }
@@ -571,7 +584,10 @@ function add(parent: HTMLElement, ...children: (Node | string | null | undefined
 }
 
 const GLOSSARY: Record<string, string> = {
-  Link: "A cable between two ports. Up when both ends are powered and the cable is intact.",
+  Link: "A cable between two ports. Up when both ends are powered, the cable is intact and the run is within the medium's limit (copper 100 m, fiber kilometres).",
+  "MAC address": "The hardware address burned into a network interface (02:4d:48:…). Switches forward by it; ARP maps an IP to it.",
+  ARP: "Address Resolution Protocol: \"who has 192.168.1.1?\" A host asks the local network for the MAC behind an IP before it can send the first frame.",
+  Latency: "Time for a packet to cross links and devices. Each cable adds propagation delay, each router adds processing; ping reports the round trip.",
   Switch: "Joins devices into one local network, forwarding frames by hardware (MAC) address. Knows nothing about IP.",
   "IP address / mask": "192.168.1.10/24: the first 24 bits name the network, the rest the host. Same network part = can talk directly.",
   "Default gateway": "The router's address on your network. Anything not local is sent there.",

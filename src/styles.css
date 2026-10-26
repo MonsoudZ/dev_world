@@ -1213,3 +1213,67 @@ input[type="checkbox"] {
   margin-top: 4px;
   font-family: var(--font);
 }
+
+/* ---- realism pass ---- */
+.led.amber {
+  background: #ffb74d;
+  box-shadow: 0 0 8px #ffb74d;
+  animation: blink 1s infinite;
+}
+@keyframes blink {
+  50% {
+    opacity: 0.35;
+  }
+}
+.mac {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted);
+  margin-left: 8px;
+  font-weight: 400;
+  letter-spacing: 0.02em;
+}
+.logs {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-family: var(--mono);
+  font-size: 11px;
+  max-height: 260px;
+  overflow: auto;
+}
+.log-line {
+  display: flex;
+  gap: 10px;
+  color: #c9d3e5;
+}
+.log-line .log-t {
+  color: var(--muted);
+  flex: none;
+  min-width: 96px;
+}
+.log-line.warn {
+  color: var(--warn);
+}
+.log-line.error {
+  color: var(--bad);
+}
+.medium-opt {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  text-align: left;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--line);
+  color: var(--text);
+  padding: 10px 12px;
+  border-radius: 10px;
+  cursor: pointer;
+  font: inherit;
+}
+.medium-opt:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+.medium-opt.bad {
+  opacity: 0.75;
+}
