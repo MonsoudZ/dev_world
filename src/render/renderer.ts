@@ -339,22 +339,55 @@ export class Renderer {
     const fiber = this.fiberPath.map((p) => ({ x: p.x + 0.5, y: p.y + 0.5 }));
     this.strokePath(fiber, "rgba(0,0,0,0.3)", 4 * cam.zoom, undefined, -0.3);
     this.strokePath(fiber, "rgba(255,150,40,0.9)", 2.2 * cam.zoom, [8 * cam.zoom, 5 * cam.zoom], -0.3);
+    // Shared poles: every few tiles along the roads that carry cables.
+    const poleAt = new Map<string, Pt>();
+    for (const cab of s.cables) {
+      for (let i = 0; i < cab.points.length; i += 3) {
+        const p = cab.points[i];
+        const key = `${p.x},${p.y}`;
+        if (!poleAt.has(key)) poleAt.set(key, { x: p.x + 0.5 + 0.34, y: p.y + 0.5 + 0.34 });
+      }
+    }
+    const POLE_H = 36;
     for (const cab of s.cables) {
       const upColor = cab.medium === "fiber" ? "rgba(255,190,70,0.95)" : "rgba(60,230,170,0.95)";
       const color = cab.state === "up" ? upColor : cab.state === "down" ? "rgba(255,80,80,0.95)" : "rgba(200,200,210,0.8)";
       const pts = cab.points.map((p) => ({ x: p.x + 0.5, y: p.y + 0.5 }));
-      this.strokePath(pts, "rgba(0,0,0,0.35)", 4.5 * cam.zoom, undefined, cab.offset);
-      this.strokePath(pts, color, 2.4 * cam.zoom, cab.state === "down" ? [5 * cam.zoom, 5 * cam.zoom] : undefined, cab.offset);
+      // Aerial run: from the first pole to the last, sagging between poles.
+      const anchors: Pt[] = [];
+      for (let i = 0; i < cab.points.length; i += 3) anchors.push(poleAt.get(`${cab.points[i].x},${cab.points[i].y}`)!);
+      const last = cab.points[cab.points.length - 1];
+      const lastKey = `${last.x},${last.y}`;
+      if (!poleAt.has(lastKey)) poleAt.set(lastKey, { x: last.x + 0.5 + 0.34, y: last.y + 0.5 + 0.34 });
+      if (anchors[anchors.length - 1] !== poleAt.get(lastKey)) anchors.push(poleAt.get(lastKey)!);
+      c.strokeStyle = color;
+      c.lineWidth = Math.max(1, 1.6 * cam.zoom);
+      c.setLineDash(cab.state === "down" ? [4 * cam.zoom, 4 * cam.zoom] : []);
+      const lane = cab.offset * 1.2;
+      for (let i = 1; i < anchors.length; i++) {
+        const a = cam.toScreen(anchors[i - 1].x, anchors[i - 1].y, POLE_H - 4 + lane);
+        const b = cam.toScreen(anchors[i].x, anchors[i].y, POLE_H - 4 + lane);
+        c.beginPath();
+        c.moveTo(a.x, a.y);
+        c.quadraticCurveTo((a.x + b.x) / 2, (a.y + b.y) / 2 + 7 * cam.zoom, b.x, b.y);
+        c.stroke();
+      }
+      c.setLineDash([]);
+      // drops from the end poles down to the buildings' wall boxes
       for (const end of [pts[0], pts[pts.length - 1]]) {
-        const p = cam.toScreen(end.x + cab.offset * 0.3, end.y + cab.offset * 0.3);
+        const pole = poleAt.get(`${end.x - 0.5},${end.y - 0.5}`)!;
+        const top = cam.toScreen(pole.x, pole.y, POLE_H - 4 + lane);
+        const box = cam.toScreen(end.x + cab.offset * 0.3, end.y - 0.25 + cab.offset * 0.3, 8);
+        c.strokeStyle = color;
+        c.lineWidth = Math.max(1, 1.4 * cam.zoom);
+        c.beginPath();
+        c.moveTo(top.x, top.y);
+        c.quadraticCurveTo(top.x, box.y, box.x, box.y);
+        c.stroke();
         c.fillStyle = "#1b2130";
-        c.beginPath();
-        c.arc(p.x, p.y, 4 * cam.zoom, 0, Math.PI * 2);
-        c.fill();
+        c.fillRect(box.x - 3 * cam.zoom, box.y - 3 * cam.zoom, 6 * cam.zoom, 6 * cam.zoom);
         c.fillStyle = color;
-        c.beginPath();
-        c.arc(p.x, p.y, 2.5 * cam.zoom, 0, Math.PI * 2);
-        c.fill();
+        c.fillRect(box.x - 1.5 * cam.zoom, box.y - 1.5 * cam.zoom, 3 * cam.zoom, 3 * cam.zoom);
       }
       if (cab.state === "down") {
         const mid = pointAlong(pts, pathLength(pts) / 2)!;
@@ -372,6 +405,25 @@ export class Renderer {
         c.fillStyle = "#ff6b6b";
         c.fillText("NO LINK", mp.x, mp.y - 16 * cam.zoom);
       }
+    }
+    for (const pole of poleAt.values()) {
+      const base = cam.toScreen(pole.x, pole.y);
+      const top = cam.toScreen(pole.x, pole.y, POLE_H);
+      c.fillStyle = "rgba(0,0,0,0.2)";
+      c.beginPath();
+      c.ellipse(base.x + 2 * cam.zoom, base.y + 1, 5 * cam.zoom, 2.5 * cam.zoom, 0, 0, Math.PI * 2);
+      c.fill();
+      c.strokeStyle = this.nightMix("#6d4c41", s.light);
+      c.lineWidth = Math.max(1.5, 2.6 * cam.zoom);
+      c.beginPath();
+      c.moveTo(base.x, base.y);
+      c.lineTo(top.x, top.y);
+      c.stroke();
+      c.lineWidth = Math.max(1, 1.6 * cam.zoom);
+      c.beginPath();
+      c.moveTo(top.x - 7 * cam.zoom, top.y + 4 * cam.zoom);
+      c.lineTo(top.x + 7 * cam.zoom, top.y + 4 * cam.zoom);
+      c.stroke();
     }
   }
 

@@ -7,6 +7,7 @@ import { ipToStr, parseIp } from "../net/ip";
 import { TraceResult } from "../net/sim";
 import { building, cableLengthM } from "../world/map";
 import { Terminal } from "./terminal";
+import { RoomView } from "./room";
 
 export class Workspace {
   root: HTMLElement;
@@ -15,10 +16,23 @@ export class Workspace {
   private picker: { ifaceId: string } | null = null;
   private mediumChoice: { ifaceId: string; targetId: string; lengthM: number } | null = null;
   private showAllLogs = false;
+  private room: RoomView;
+  private roomCollapsed = false;
 
   constructor(private game: Game, private host: HTMLElement) {
     this.root = el("div", { class: "ws-overlay hidden" });
     host.append(this.root);
+    this.room = new RoomView(game, {
+      onSelectDevice: (id) => {
+        this.selectedDevice = id;
+        this.render();
+      },
+      onPortClick: (iface) => {
+        this.selectedDevice = iface.deviceId;
+        if (!iface.linkId && !iface.locked) this.picker = { ifaceId: iface.id };
+        this.render();
+      },
+    });
     game.events.on("workspace", () => this.render());
     game.events.on("change", () => {
       if (!this.root.classList.contains("hidden") && !this.root.contains(document.activeElement)) this.render();
@@ -74,6 +88,23 @@ export class Workspace {
         el("button", { class: "btn ghost", onclick: () => this.close() }, "Back to map  ⎋")
       ),
       pendingBanner,
+      el(
+        "div",
+        { class: `ws-room ${this.roomCollapsed ? "collapsed" : ""}` },
+        this.roomCollapsed ? null : this.room.render(bid, this.selectedDevice),
+        el(
+          "button",
+          {
+            class: "btn tiny ghost room-toggle",
+            onclick: () => {
+              this.roomCollapsed = !this.roomCollapsed;
+              this.render();
+            },
+          },
+          this.roomCollapsed ? "Show room" : "Hide room"
+        ),
+        this.roomCollapsed ? null : el("div", { class: "room-hint muted small" }, "Click equipment to select it. Click an empty port to run a cable from it.")
+      ),
       el(
         "div",
         { class: "ws-body" },

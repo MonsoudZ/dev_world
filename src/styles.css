@@ -1329,3 +1329,178 @@ input[type="checkbox"] {
 .banner p {
   color: #c9d3e5;
 }
+
+/* ---- room view ---- */
+.ws-room {
+  position: relative;
+  border-bottom: 1px solid var(--line);
+  background: #0b0e14;
+  flex: none;
+}
+.ws-room svg.room {
+  display: block;
+  width: 100%;
+  height: clamp(200px, 30vh, 330px);
+}
+.ws-room.collapsed {
+  height: 34px;
+}
+.room-toggle {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  background: rgba(10, 14, 24, 0.7);
+}
+.room-hint {
+  position: absolute;
+  left: 10px;
+  bottom: 6px;
+  background: rgba(10, 14, 24, 0.6);
+  padding: 2px 8px;
+  border-radius: 6px;
+  pointer-events: none;
+}
+.room text {
+  font-family: var(--font);
+  pointer-events: none;
+}
+.room .room-label {
+  font-size: 12px;
+  fill: rgba(255, 255, 255, 0.5);
+}
+.room .rack-brand {
+  font-size: 9px;
+  fill: #6b7280;
+  letter-spacing: 0.2em;
+}
+.room .faceplate-label {
+  font-size: 10px;
+  font-weight: 600;
+  fill: #e5e7eb;
+}
+.room .faceplate-model {
+  font-size: 8px;
+  fill: #9ca3af;
+  letter-spacing: 0.08em;
+}
+.room .faceplate-label.dark,
+.room .faceplate-model.dark,
+.room .port-label.dark {
+  fill: #374151;
+}
+.room .port-label {
+  font-size: 7px;
+  fill: #9ca3af;
+  letter-spacing: 0.05em;
+}
+.room .host-label {
+  font-size: 11px;
+  font-weight: 600;
+  fill: rgba(255, 255, 255, 0.85);
+  paint-order: stroke;
+  stroke: rgba(0, 0, 0, 0.5);
+  stroke-width: 3px;
+}
+.room .host-label.sel {
+  fill: #5ac8ff;
+}
+.room .person-label {
+  font-size: 10px;
+  fill: #fff;
+  paint-order: stroke;
+  stroke: rgba(0, 0, 0, 0.5);
+  stroke-width: 3px;
+}
+.room .plate-label {
+  font-size: 9px;
+  fill: rgba(255, 255, 255, 0.8);
+  paint-order: stroke;
+  stroke: rgba(0, 0, 0, 0.6);
+  stroke-width: 3px;
+}
+.room .screen-text {
+  font-size: 7px;
+  fill: #9ecbff;
+}
+.room .screen-glyph {
+  font-size: 9px;
+  font-weight: 700;
+}
+.room .screen-glyph.ok {
+  fill: #1f9d6a;
+}
+.room .screen-glyph.nolink,
+.room .screen-glyph.noaddr {
+  fill: #c98a00;
+}
+.room .screen-glyph.offline {
+  fill: #d33;
+}
+.room .empty-rack {
+  font-size: 12px;
+  fill: #4b5563;
+}
+.room .unit,
+.room .host {
+  cursor: pointer;
+}
+.room .unit:hover rect:first-of-type {
+  stroke: #9ad8ff;
+}
+.room .unit.off {
+  opacity: 0.75;
+}
+.room .port {
+  cursor: pointer;
+}
+.room .port:hover rect {
+  stroke: #5ac8ff;
+  stroke-width: 1.5;
+}
+.room .cable {
+  fill: none;
+  stroke-width: 2.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.room .cable.shadow {
+  stroke: rgba(0, 0, 0, 0.45);
+  stroke-width: 4.5;
+}
+.room .cable.broken {
+  stroke-dasharray: 6 5;
+  animation: dash 1s linear infinite;
+}
+@keyframes dash {
+  to {
+    stroke-dashoffset: -11;
+  }
+}
+.room .blink {
+  animation: ledblink 1.4s steps(2, start) infinite;
+}
+@keyframes ledblink {
+  50% {
+    opacity: 0.35;
+  }
+}
+.room .boot-bar {
+  animation: bootbar 1.6s ease-in-out infinite alternate;
+  transform-origin: left;
+}
+@keyframes bootbar {
+  from {
+    transform: scaleX(0.3);
+  }
+  to {
+    transform: scaleX(1.8);
+  }
+}
+@media (max-width: 760px) {
+  .ws-overlay {
+    padding-top: 128px;
+  }
+  .ws-room svg.room {
+    height: clamp(160px, 22vh, 240px);
+  }
+}
