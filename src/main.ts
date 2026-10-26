@@ -193,6 +193,10 @@ canvas.addEventListener("touchend", (e) => {
 let lastT = performance.now();
 let personPhase = 0;
 function frame(now: number) {
+  frameOnce(now);
+  requestAnimationFrame(frame);
+}
+function frameOnce(now: number) {
   const dt = Math.min(0.1, (now - lastT) / 1000);
   lastT = now;
   game.tick(dt);
@@ -237,9 +241,12 @@ function frame(now: number) {
   };
   renderer.draw(state);
   panels.tick(dt);
-  requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
 
-// Expose for debugging in the console.
-(window as unknown as { game: Game }).game = game;
+// Expose for debugging in the console (and to render a frame on demand when the tab is hidden).
+(window as unknown as { game: Game; drawOnce: () => void }).game = game;
+(window as unknown as { drawOnce: () => void }).drawOnce = () => {
+  renderer.resize();
+  frameOnce(performance.now());
+};

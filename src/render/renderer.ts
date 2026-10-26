@@ -102,12 +102,134 @@ export class Renderer {
   private gctx: CanvasRenderingContext2D;
   private groundKey = "";
 
+  private pat!: Record<"noise" | "brick" | "stone" | "planks" | "siding" | "shingles" | "gravel" | "asphalt" | "slabs" | "grass", CanvasPattern>;
+
   constructor(public canvas: HTMLCanvasElement, public cam: Camera) {
     this.ctx = canvas.getContext("2d")!;
     const ws = building("workshop");
     this.fiberPath = roadPath({ x: 0, y: 3 }, ws.door);
     this.ground = document.createElement("canvas");
     this.gctx = this.ground.getContext("2d")!;
+    this.makePatterns();
+  }
+
+  // ------------------------------------------------------------------ textures
+  private makePatterns() {
+    const make = (w: number, h: number, draw: (c: CanvasRenderingContext2D) => void) => {
+      const cv = document.createElement("canvas");
+      cv.width = w;
+      cv.height = h;
+      const c = cv.getContext("2d")!;
+      draw(c);
+      return this.ctx.createPattern(cv, "repeat")!;
+    };
+    const noise = (c: CanvasRenderingContext2D, w: number, h: number, a: number, seed: number) => {
+      for (let y = 0; y < h; y++)
+        for (let x = 0; x < w; x++) {
+          const v = hash(x, y, seed);
+          c.fillStyle = v > 0.5 ? `rgba(255,255,255,${(v - 0.5) * a})` : `rgba(0,0,0,${(0.5 - v) * a})`;
+          c.fillRect(x, y, 1, 1);
+        }
+    };
+    this.pat = {
+      noise: make(48, 48, (c) => noise(c, 48, 48, 0.22, 1)),
+      grass: make(64, 64, (c) => {
+        noise(c, 64, 64, 0.16, 2);
+        for (let i = 0; i < 40; i++) {
+          const x = hash(i, 1, 3) * 64;
+          const y = hash(i, 2, 3) * 64;
+          c.strokeStyle = `rgba(20,70,20,${0.25 + hash(i, 3, 3) * 0.3})`;
+          c.beginPath();
+          c.moveTo(x, y);
+          c.lineTo(x + (hash(i, 4, 3) - 0.5) * 3, y - 2 - hash(i, 5, 3) * 3);
+          c.stroke();
+        }
+      }),
+      brick: make(32, 16, (c) => {
+        noise(c, 32, 16, 0.18, 4);
+        c.fillStyle = "rgba(0,0,0,0.32)";
+        c.fillRect(0, 7, 32, 1.5);
+        c.fillRect(0, 15, 32, 1.5);
+        c.fillRect(15, 0, 1.5, 8);
+        c.fillRect(31, 0, 1.5, 8);
+        c.fillRect(7, 8, 1.5, 8);
+        c.fillRect(23, 8, 1.5, 8);
+        c.fillStyle = "rgba(255,255,255,0.08)";
+        c.fillRect(0, 0, 32, 1);
+        c.fillRect(0, 8.5, 32, 1);
+      }),
+      stone: make(48, 24, (c) => {
+        noise(c, 48, 24, 0.14, 5);
+        c.fillStyle = "rgba(0,0,0,0.28)";
+        c.fillRect(0, 11, 48, 1.5);
+        c.fillRect(0, 23, 48, 1.5);
+        c.fillRect(23, 0, 1.5, 12);
+        c.fillRect(11, 12, 1.5, 12);
+        c.fillRect(35, 12, 1.5, 12);
+        c.fillStyle = "rgba(255,255,255,0.1)";
+        c.fillRect(0, 0, 48, 1);
+        c.fillRect(0, 12.5, 48, 1);
+      }),
+      planks: make(24, 32, (c) => {
+        noise(c, 24, 32, 0.12, 6);
+        c.fillStyle = "rgba(0,0,0,0.3)";
+        for (let x = 0; x < 24; x += 8) c.fillRect(x, 0, 1.2, 32);
+        c.fillStyle = "rgba(0,0,0,0.12)";
+        for (let x = 0; x < 24; x += 8) c.fillRect(x + 4, 0, 0.6, 32);
+      }),
+      siding: make(32, 12, (c) => {
+        noise(c, 32, 12, 0.08, 7);
+        c.fillStyle = "rgba(0,0,0,0.28)";
+        c.fillRect(0, 5, 32, 1.2);
+        c.fillRect(0, 11, 32, 1.2);
+        c.fillStyle = "rgba(255,255,255,0.12)";
+        c.fillRect(0, 0, 32, 1);
+        c.fillRect(0, 6.2, 32, 1);
+      }),
+      shingles: make(24, 12, (c) => {
+        noise(c, 24, 12, 0.14, 8);
+        c.fillStyle = "rgba(0,0,0,0.35)";
+        c.fillRect(0, 5, 24, 1.4);
+        c.fillRect(0, 11, 24, 1.4);
+        c.fillRect(11, 0, 1, 6);
+        c.fillRect(5, 6, 1, 6);
+        c.fillRect(17, 6, 1, 6);
+        c.fillStyle = "rgba(255,255,255,0.1)";
+        c.fillRect(0, 0, 24, 1);
+        c.fillRect(0, 6.4, 24, 1);
+      }),
+      gravel: make(32, 32, (c) => noise(c, 32, 32, 0.3, 9)),
+      asphalt: make(40, 40, (c) => {
+        noise(c, 40, 40, 0.2, 10);
+        for (let i = 0; i < 30; i++) {
+          c.fillStyle = `rgba(255,255,255,${0.04 + hash(i, 7, 11) * 0.08})`;
+          c.fillRect(hash(i, 1, 11) * 40, hash(i, 2, 11) * 40, 1, 1);
+        }
+      }),
+      slabs: make(20, 20, (c) => {
+        noise(c, 20, 20, 0.1, 12);
+        c.fillStyle = "rgba(0,0,0,0.2)";
+        c.fillRect(0, 19, 20, 1);
+        c.fillRect(19, 0, 1, 20);
+      }),
+    };
+  }
+
+  /**
+   * Fill a parallelogram face with a texture that follows its perspective.
+   * p0: screen origin, u: screen vector for one world unit along the face, v: for one unit up/across,
+   * uLen/vLen: face size in those units. Pattern pixels stay roughly screen-sized.
+   */
+  private texturedFace(c: CanvasRenderingContext2D, p0: Pt, u: Pt, v: Pt, uLen: number, vLen: number, pattern: CanvasPattern, alpha: number, texScale = 1) {
+    c.save();
+    c.transform(u.x, u.y, v.x, v.y, p0.x, p0.y);
+    const ul = Math.hypot(u.x, u.y) || 1;
+    const vl = Math.hypot(v.x, v.y) || 1;
+    pattern.setTransform(new DOMMatrix([texScale / ul, 0, 0, texScale / vl, 0, 0]));
+    c.globalAlpha = alpha;
+    c.fillStyle = pattern;
+    c.fillRect(0, 0, uLen, vLen);
+    c.restore();
   }
 
   resize() {
@@ -123,7 +245,7 @@ export class Renderer {
   }
 
   // ------------------------------------------------------------------ helpers
-  private poly(c: CanvasRenderingContext2D, pts: Pt[], fill?: string, stroke?: string, lw = 1) {
+  private poly(c: CanvasRenderingContext2D, pts: Pt[], fill?: string | CanvasGradient | CanvasPattern, stroke?: string, lw = 1) {
     c.beginPath();
     pts.forEach((p, i) => (i ? c.lineTo(p.x, p.y) : c.moveTo(p.x, p.y)));
     c.closePath();
@@ -177,8 +299,19 @@ export class Renderer {
     if (s.showTraffic) this.drawPackets(s);
     this.drawNight(s);
     this.drawRain(s);
+    this.drawVignette();
     this.drawLabels(s);
     c.setTransform(1, 0, 0, 1, 0, 0);
+  }
+
+  private drawVignette() {
+    const c = this.ctx;
+    const cam = this.cam;
+    const g = c.createRadialGradient(cam.width / 2, cam.height / 2, Math.min(cam.width, cam.height) * 0.45, cam.width / 2, cam.height / 2, Math.max(cam.width, cam.height) * 0.75);
+    g.addColorStop(0, "rgba(0,0,0,0)");
+    g.addColorStop(1, "rgba(0,0,0,0.28)");
+    c.fillStyle = g;
+    c.fillRect(0, 0, cam.width, cam.height);
   }
 
   // ------------------------------------------------------------------ ground (cached)
@@ -214,6 +347,12 @@ export class Renderer {
         const v = hash(x + 100, y + 100, 5);
         const field = v > 0.82 ? "#c9b45e" : v > 0.7 ? "#7fb366" : "#6aa157";
         this.poly(c, this.tilePoly(x, y), this.nightMix(this.shade(field, 0.95 - d * 0.035 + v * 0.06), light));
+        if (d < 6) {
+          const o = cam.toScreen(x, y);
+          const ux = { x: cam.toScreen(x + 1, y).x - o.x, y: cam.toScreen(x + 1, y).y - o.y };
+          const vy = { x: cam.toScreen(x, y + 1).x - o.x, y: cam.toScreen(x, y + 1).y - o.y };
+          this.texturedFace(c, o, ux, vy, 1, 1, v > 0.82 ? this.pat.noise : this.pat.grass, Math.max(0.1, 0.5 - d * 0.07));
+        }
         if (v > 0.93 && d < 6) {
           const p = cam.toScreen(x + 0.5, y + 0.5);
           c.fillStyle = this.nightMix("#3f8f3a", light);
@@ -233,6 +372,12 @@ export class Renderer {
         else if (t === "plaza") col = this.shade(col, 0.96 + hash(x, y, 3) * 0.08);
         else if (t === "water") col = this.shade(col, 0.9);
         this.poly(c, pts, this.nightMix(col, light));
+        if (t === "road" || t === "grass" || t === "plaza") {
+          const o = cam.toScreen(x, y);
+          const ux = { x: cam.toScreen(x + 1, y).x - o.x, y: cam.toScreen(x + 1, y).y - o.y };
+          const vy = { x: cam.toScreen(x, y + 1).x - o.x, y: cam.toScreen(x, y + 1).y - o.y };
+          this.texturedFace(c, o, ux, vy, 1, 1, t === "road" ? this.pat.asphalt : t === "grass" ? this.pat.grass : this.pat.slabs, t === "road" ? 0.9 : t === "grass" ? 0.55 : 0.7, t === "plaza" ? 0.5 : 1);
+        }
         if (t === "road") this.drawRoadMarkings(c, x, y, light);
         if (t === "plaza") this.poly(c, pts, undefined, "rgba(0,0,0,0.08)", 1);
         if (t === "grass" && hash(x, y, 11) > 0.72) {
@@ -249,6 +394,12 @@ export class Renderer {
       const { x, y, w, h } = b.lot;
       const pave = this.nightMix("#c8c2b4", light);
       this.poly(c, this.rect(x - 0.3, y - 0.3, x + w + 0.3, y + h + 0.3), pave, "rgba(0,0,0,0.12)");
+      {
+        const o = cam.toScreen(x - 0.3, y - 0.3);
+        const ux = { x: cam.toScreen(x + 0.7, y - 0.3).x - o.x, y: cam.toScreen(x + 0.7, y - 0.3).y - o.y };
+        const vy = { x: cam.toScreen(x - 0.3, y + 0.7).x - o.x, y: cam.toScreen(x - 0.3, y + 0.7).y - o.y };
+        this.texturedFace(c, o, ux, vy, w + 0.6, h + 0.6, this.pat.slabs, 0.6, 0.5);
+      }
       const dx = b.door.x + 0.5;
       const dy = b.door.y + 0.5;
       const cx = clamp(dx, x + 0.3, x + w - 0.3);
@@ -479,15 +630,45 @@ export class Renderer {
       this.poly(c, ring, s.cableTargetMode && s.hoverBuilding === b.id ? "rgba(90,200,255,0.18)" : undefined, col, (s.focus === b.id ? 3 : 2) * z);
     }
 
-    this.poly(c, this.rect(x0 + 0.15, y0 + 0.15, x1 + 0.4, y1 + 0.4), `rgba(0,0,0,${0.12 + 0.1 * light})`);
+    // Sun-cast shadow: short at midday, long and soft toward evening, thrown to the south-east.
+    const sunLen = (0.3 + 0.9 * (1 - light)) * (h / 40);
+    const sh = [cam.toScreen(x0, y0), cam.toScreen(x1, y0), cam.toScreen(x1 + sunLen, y0 + sunLen * 0.6), cam.toScreen(x1 + sunLen, y1 + sunLen), cam.toScreen(x0 + sunLen * 0.6, y1 + sunLen), cam.toScreen(x0, y1)];
+    this.poly(c, sh, `rgba(10,12,30,${0.16 + 0.14 * light})`);
 
     const base = vis.unlocked ? b.color : "#9a9a9a";
     const right = [cam.toScreen(x1, y0), cam.toScreen(x1, y1), cam.toScreen(x1, y1, h), cam.toScreen(x1, y0, h)];
     const left = [cam.toScreen(x0, y1), cam.toScreen(x1, y1), cam.toScreen(x1, y1, h), cam.toScreen(x0, y1, h)];
-    this.poly(c, left, mix(base), "rgba(0,0,0,0.18)");
-    this.poly(c, right, mix(this.shade(base, 0.72)), "rgba(0,0,0,0.18)");
-    this.poly(c, [cam.toScreen(x0, y1), cam.toScreen(x1, y1), cam.toScreen(x1, y1, 4), cam.toScreen(x0, y1, 4)], mix(this.shade(base, 0.6)));
-    this.poly(c, [cam.toScreen(x1, y0), cam.toScreen(x1, y1), cam.toScreen(x1, y1, 4), cam.toScreen(x1, y0, 4)], mix(this.shade(base, 0.5)));
+    this.poly(c, left, mix(base));
+    this.poly(c, right, mix(this.shade(base, 0.72)));
+    // wall material following each face's perspective
+    const wallPat = b.kind === "workshop" ? this.pat.brick : b.kind === "library" || b.kind === "hall" ? this.pat.stone : b.kind === "shop" ? this.pat.planks : b.kind === "house" ? this.pat.siding : this.pat.noise;
+    const vz = { x: 0, y: -z };
+    const s0 = cam.toScreen(x0, y1, 0);
+    const su = { x: cam.toScreen(x0 + 1, y1, 0).x - s0.x, y: cam.toScreen(x0 + 1, y1, 0).y - s0.y };
+    this.texturedFace(c, s0, su, vz, b.lot.w, h, wallPat, 0.9);
+    const e0 = cam.toScreen(x1, y0, 0);
+    const eu = { x: cam.toScreen(x1, y0 + 1, 0).x - e0.x, y: cam.toScreen(x1, y0 + 1, 0).y - e0.y };
+    this.texturedFace(c, e0, eu, vz, b.lot.h, h, wallPat, 0.9);
+    // ambient occlusion at the base and a lit edge on the corner
+    const aoS = c.createLinearGradient(0, cam.toScreen(x0, y1, 0).y, 0, cam.toScreen(x0, y1, 12).y);
+    aoS.addColorStop(0, "rgba(0,0,0,0.35)");
+    aoS.addColorStop(1, "rgba(0,0,0,0)");
+    this.poly(c, [cam.toScreen(x0, y1), cam.toScreen(x1, y1), cam.toScreen(x1, y1, 12), cam.toScreen(x0, y1, 12)], aoS);
+    this.poly(c, [cam.toScreen(x1, y0), cam.toScreen(x1, y1), cam.toScreen(x1, y1, 12), cam.toScreen(x1, y0, 12)], aoS);
+    c.strokeStyle = "rgba(0,0,0,0.25)";
+    c.lineWidth = 1;
+    this.poly(c, left, undefined, "rgba(0,0,0,0.25)");
+    this.poly(c, right, undefined, "rgba(0,0,0,0.3)");
+    {
+      const k0 = cam.toScreen(x1, y1, 0);
+      const k1 = cam.toScreen(x1, y1, h);
+      c.strokeStyle = `rgba(255,255,255,${0.18 * light})`;
+      c.lineWidth = Math.max(1, 1.2 * z);
+      c.beginPath();
+      c.moveTo(k0.x, k0.y);
+      c.lineTo(k1.x, k1.y);
+      c.stroke();
+    }
 
     const lit = vis.powered || vis.online;
     this.drawWindows(b, "south", lit, s);
@@ -503,15 +684,21 @@ export class Renderer {
       const alongX = b.lot.w >= b.lot.h;
       const r0 = alongX ? cam.toScreen(x0 - 0.1, (y0 + y1) / 2, ridgeH) : cam.toScreen((x0 + x1) / 2, y0 - 0.1, ridgeH);
       const r1 = alongX ? cam.toScreen(x1 + 0.1, (y0 + y1) / 2, ridgeH) : cam.toScreen((x0 + x1) / 2, y1 + 0.1, ridgeH);
-      if (alongX) {
-        this.poly(c, [top[0], top[1], r1, r0], mix(this.shade(roofCol, 0.85)), "rgba(0,0,0,0.2)");
-        this.poly(c, [top[3], top[2], r1, r0], mix(roofCol), "rgba(0,0,0,0.2)");
-        this.poly(c, [top[1], top[2], r1], mix(this.shade(base, 0.8)), "rgba(0,0,0,0.2)");
-      } else {
-        this.poly(c, [top[0], top[3], r1, r0], mix(this.shade(roofCol, 0.85)), "rgba(0,0,0,0.2)");
-        this.poly(c, [top[1], top[2], r1, r0], mix(roofCol), "rgba(0,0,0,0.2)");
-        this.poly(c, [top[3], top[2], r1], mix(this.shade(base, 0.8)), "rgba(0,0,0,0.2)");
-      }
+      const slopes: Pt[][] = alongX ? [[top[0], top[1], r1, r0], [top[3], top[2], r1, r0]] : [[top[0], top[3], r1, r0], [top[1], top[2], r1, r0]];
+      slopes.forEach((sl, i) => {
+        this.poly(c, sl, mix(this.shade(roofCol, i === 0 ? 0.85 : 1)), "rgba(0,0,0,0.25)");
+        const u = { x: sl[1].x - sl[0].x, y: sl[1].y - sl[0].y };
+        const v = { x: sl[3].x - sl[0].x, y: sl[3].y - sl[0].y };
+        this.texturedFace(c, sl[0], u, v, 1, 1, this.pat.shingles, 0.85, 1);
+      });
+      this.poly(c, alongX ? [top[1], top[2], r1] : [top[3], top[2], r1], mix(this.shade(base, 0.8)), "rgba(0,0,0,0.2)");
+      // ridge cap
+      c.strokeStyle = mix(this.shade(roofCol, 0.6));
+      c.lineWidth = Math.max(1, 2 * z);
+      c.beginPath();
+      c.moveTo(r0.x, r0.y);
+      c.lineTo(r1.x, r1.y);
+      c.stroke();
       const chx = x0 + 0.35;
       const chy = y0 + 0.35;
       this.box(chx, chy, 0.25, 0.25, h + 6, 16, mix("#8d6e63"), mix("#6d4c41"), mix("#5d4037"));
@@ -528,6 +715,20 @@ export class Renderer {
     } else {
       this.poly(c, top, mix(roofCol), "rgba(0,0,0,0.25)");
       this.poly(c, this.rect(x0 + 0.18, y0 + 0.18, x1 - 0.18, y1 - 0.18, h), mix(this.shade(roofCol, 1.12)));
+      {
+        const o = cam.toScreen(x0 + 0.18, y0 + 0.18, h);
+        const u = { x: cam.toScreen(x0 + 1.18, y0 + 0.18, h).x - o.x, y: cam.toScreen(x0 + 1.18, y0 + 0.18, h).y - o.y };
+        const v = { x: cam.toScreen(x0 + 0.18, y0 + 1.18, h).x - o.x, y: cam.toScreen(x0 + 0.18, y0 + 1.18, h).y - o.y };
+        this.texturedFace(c, o, u, v, b.lot.w - 0.36, b.lot.h - 0.36, this.pat.gravel, 0.7);
+      }
+      // parapet highlight on the sunlit edges
+      c.strokeStyle = `rgba(255,255,255,${0.25 * light})`;
+      c.lineWidth = Math.max(1, 1.2 * z);
+      c.beginPath();
+      c.moveTo(top[3].x, top[3].y);
+      c.lineTo(top[0].x, top[0].y);
+      c.lineTo(top[1].x, top[1].y);
+      c.stroke();
       if (b.kind === "workshop" || b.kind === "clinic" || b.kind === "library" || b.kind === "hall") {
         this.box(x1 - 0.8, y0 + 0.3, 0.45, 0.35, h, 10, mix("#cfd8dc"), mix("#90a4ae"), mix("#78909c"));
       }
@@ -743,14 +944,38 @@ export class Renderer {
         const isLit = lit && night > 0.25 && seed > 0.25;
         const warm = `rgba(255,${200 + Math.round(seed * 40)},120,${0.75 + 0.25 * night})`;
         const glass = `rgba(${Math.round(120 + 60 * s.light)},${Math.round(160 + 50 * s.light)},${Math.round(200 + 30 * s.light)},0.9)`;
-        this.poly(c, pts, isLit ? warm : glass, "rgba(0,0,0,0.25)", 1);
+        // recess shadow, frame, glass, sill
+        const frame = this.nightMix(b.trim, s.light);
+        this.poly(c, pts.map((p) => ({ x: p.x + 1, y: p.y + 1 })), "rgba(0,0,0,0.3)");
+        this.poly(c, pts, frame);
+        const inset = pts.map((p, k) => ({ x: p.x + (k === 0 || k === 3 ? 1.2 : -1.2) * cam.zoom, y: p.y + (k < 2 ? 1.2 : -1.2) * cam.zoom }));
+        this.poly(c, inset, isLit ? warm : glass);
         if (!isLit) {
+          // glass reflection and mullion
           c.strokeStyle = "rgba(255,255,255,0.35)";
+          c.lineWidth = 1;
           c.beginPath();
-          c.moveTo(pts[3].x, pts[3].y);
-          c.lineTo(pts[0].x, pts[0].y);
+          c.moveTo(inset[3].x, inset[3].y);
+          c.lineTo(inset[0].x, inset[0].y);
           c.stroke();
         }
+        if (cam.zoom > 0.9) {
+          c.strokeStyle = frame;
+          c.lineWidth = 1;
+          c.beginPath();
+          c.moveTo((inset[0].x + inset[3].x) / 2, (inset[0].y + inset[3].y) / 2);
+          c.lineTo((inset[1].x + inset[2].x) / 2, (inset[1].y + inset[2].y) / 2);
+          c.stroke();
+        }
+        // sill
+        const sillA = face === "south" ? cam.toScreen(x0 + u0 * len - 0.02, y1 + 0.03, z0 - 1) : cam.toScreen(x1 + 0.03, y0 + u0 * len - 0.02, z0 - 1);
+        const sillB = face === "south" ? cam.toScreen(x0 + u1 * len + 0.02, y1 + 0.03, z0 - 1) : cam.toScreen(x1 + 0.03, y0 + u1 * len + 0.02, z0 - 1);
+        c.strokeStyle = frame;
+        c.lineWidth = Math.max(1, 1.6 * cam.zoom);
+        c.beginPath();
+        c.moveTo(sillA.x, sillA.y);
+        c.lineTo(sillB.x, sillB.y);
+        c.stroke();
         if (isLit && cam.zoom > 0.8) {
           const cx = pts.reduce((a, p) => a + p.x, 0) / 4;
           const cy = pts.reduce((a, p) => a + p.y, 0) / 4;
@@ -812,17 +1037,29 @@ export class Renderer {
         c.moveTo(base.x, base.y);
         c.lineTo(base.x, base.y - 18 * z);
         c.stroke();
-        const greens = ["#3f8f3a", "#4ea84a", "#5fbf52"];
-        [
-          [0, -28, 14],
-          [-8, -22, 10],
-          [9, -21, 10],
-        ].forEach(([dx, dy, r], i) => {
-          c.fillStyle = this.nightMix(greens[i], light);
+        const greens = ["#2f6e2c", "#3f8f3a", "#4ea84a", "#6cc95e"];
+        const blobs: [number, number, number][] = [
+          [0, -26, 15],
+          [-9, -20, 11],
+          [10, -19, 11],
+          [-3, -33, 9],
+          [6, -31, 8],
+        ];
+        blobs.forEach(([dx, dy, r], i) => {
+          c.fillStyle = this.nightMix(greens[Math.min(3, i)], light);
           c.beginPath();
           c.arc(base.x + dx * z + sway * (i ? 0.5 : 1), base.y + dy * z, r * z, 0, Math.PI * 2);
           c.fill();
         });
+        // highlight and shaded underside
+        c.fillStyle = `rgba(255,255,220,${0.18 * light})`;
+        c.beginPath();
+        c.arc(base.x - 5 * z + sway, base.y - 33 * z, 6 * z, 0, Math.PI * 2);
+        c.fill();
+        c.fillStyle = "rgba(0,30,0,0.22)";
+        c.beginPath();
+        c.ellipse(base.x + 2 * z, base.y - 15 * z, 13 * z, 5 * z, 0, 0, Math.PI);
+        c.fill();
         break;
       }
       case "pine": {
