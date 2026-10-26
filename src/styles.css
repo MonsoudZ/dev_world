@@ -1277,3 +1277,55 @@ input[type="checkbox"] {
 .medium-opt.bad {
   opacity: 0.75;
 }
+
+/* ---- lesson flow ---- */
+.stepbar {
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+  margin: -4px 0 10px;
+}
+.stepbar span {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  transition: width 0.4s ease;
+}
+.banner {
+  position: absolute;
+  z-index: 9;
+  left: 50%;
+  top: 18%;
+  transform: translate(-50%, -20px);
+  width: min(520px, calc(100% - 40px));
+  background: var(--panel-2);
+  border: 1px solid rgba(60, 230, 170, 0.5);
+  border-radius: 16px;
+  padding: 22px 24px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5), 0 0 40px rgba(60, 230, 170, 0.15);
+  opacity: 0;
+  transition: all 0.35s ease;
+}
+.banner.show {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+.banner-tag {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--accent-2);
+  font-weight: 600;
+}
+.banner h2 {
+  margin: 4px 0 2px;
+}
+.banner-concept {
+  color: var(--muted);
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+.banner p {
+  color: #c9d3e5;
+}

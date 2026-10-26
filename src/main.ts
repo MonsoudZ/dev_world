@@ -40,6 +40,17 @@ const centerOn = (id: string) => {
   animateCamera(c.x, c.y, Math.max(cam.zoom, 1.4));
 };
 
+// Each new step with a building focus gently brings that building into view.
+let lastFocus: string | undefined;
+game.events.on("step", () => {
+  const f = game.step?.focus;
+  if (f && f !== lastFocus && !game.workspace) {
+    const c = lotCenter(building(f));
+    animateCamera(c.x, c.y, Math.max(cam.zoom, 1.0));
+  }
+  lastFocus = f;
+});
+
 const workspace = new Workspace(game, uiLayer);
 const panels = new Panels(game, uiLayer, { centerOn });
 

@@ -45,6 +45,7 @@ export class Panels {
     game.events.on("toast", (t) => this.toast(t.text, t.kind));
     game.events.on("select", () => this.renderCard());
     game.events.on("workspace", (id) => host.classList.toggle("in-workspace", !!id));
+    game.events.on("lessonComplete", (l) => this.showBanner(l));
     game.events.on("step", () => {
       this.quizState = {};
       this.hintShown = false;
@@ -250,7 +251,8 @@ export class Panels {
       { class: "lesson-head" },
       el("div", { class: "muted small" }, g.progress.finished ? "Campaign complete" : `Lesson ${idx + 1} of ${LESSONS.length} · ${lesson.concept}`),
       el("h3", {}, g.progress.finished ? "Maple Hollow is online" : lesson.title),
-      el("div", { class: "progress" }, ...LESSONS.map((l, i) => el("span", { class: `pip ${g.progress.completed.includes(l.id) ? "done" : i === idx && !g.progress.finished ? "cur" : ""}`, title: l.title })))
+      el("div", { class: "progress" }, ...LESSONS.map((l, i) => el("span", { class: `pip ${g.progress.completed.includes(l.id) ? "done" : i === idx && !g.progress.finished ? "cur" : ""}`, title: l.title }))),
+      g.progress.finished ? null : el("div", { class: "stepbar", title: `Step ${g.progress.step + 1} of ${lesson.steps.length}` }, el("span", { style: `width:${Math.round(((g.progress.step + (g.step?.kind === "task" ? 0.5 : 1)) / lesson.steps.length) * 100)}%` }))
     );
     add(this.lesson, header);
     const step = g.step;
@@ -391,6 +393,26 @@ export class Panels {
     const info = [...steps].reverse().find((s) => s.kind === "info");
     if (!info || info.kind !== "info") return null;
     return el("details", { class: "concept-drawer" }, el("summary", {}, `Concept recap: ${info.title}`), el("p", {}, info.text));
+  }
+
+  private showBanner(l: { title: string; note: string; concept: string; finished: boolean }) {
+    const b = el(
+      "div",
+      { class: "banner" },
+      el("div", { class: "banner-tag" }, l.finished ? "Campaign complete" : "Lesson complete"),
+      el("h2", {}, l.title),
+      el("div", { class: "banner-concept" }, l.concept),
+      el("p", {}, l.note),
+      el("button", { class: "btn primary", onclick: () => b.remove() }, l.finished ? "Explore the town" : "Next lesson")
+    );
+    this.host.append(b);
+    requestAnimationFrame(() => b.classList.add("show"));
+    setTimeout(() => {
+      if (b.isConnected) {
+        b.classList.remove("show");
+        setTimeout(() => b.remove(), 400);
+      }
+    }, 9000);
   }
 
   // ------------------------------------------------------------------ sandbox tools

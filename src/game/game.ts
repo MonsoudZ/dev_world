@@ -50,6 +50,7 @@ type GameEvents = {
   change: undefined;
   toast: { text: string; kind: "info" | "good" | "bad" };
   step: undefined;
+  lessonComplete: { title: string; note: string; concept: string; finished: boolean };
   workspace: string | null;
   select: string | undefined;
 };
@@ -356,7 +357,8 @@ export class Game {
     };
     const startDev = this.net.device(trace.hops[0]?.deviceId ?? "");
     if (!startDev) return;
-    let curBuilding = startDev.buildingId;
+    const EDGE = { x: 0, y: 3 }; // where the provider's fiber leaves town
+    let curBuilding = startDev.hidden ? "__internet" : startDev.buildingId;
     if (!startDev.hidden) pushPath([building(curBuilding).door]);
     for (const hop of trace.hops) {
       for (const lid of hop.linkIds) {
@@ -367,15 +369,15 @@ export class Game {
         if (da.buildingId === db.buildingId) continue;
         const other = da.buildingId === curBuilding ? db : da;
         if (other.hidden || da.hidden || db.hidden) {
-          // to/from the internet: animate to the west edge
-          const from = building(curBuilding).door;
-          pushPath(roadPath(from, { x: 0, y: 3 }));
+          // to/from the internet: animate via the west edge
+          if (curBuilding !== "__internet") pushPath(roadPath(building(curBuilding).door, EDGE));
+          else pushPath([EDGE]);
           curBuilding = other.hidden ? "__internet" : other.buildingId;
-          if (!other.hidden) pushPath(roadPath({ x: 0, y: 3 }, building(curBuilding).door));
+          if (!other.hidden) pushPath(roadPath(EDGE, building(curBuilding).door));
           continue;
         }
         if (curBuilding === "__internet") {
-          pushPath(roadPath({ x: 0, y: 3 }, building(other.buildingId).door));
+          pushPath(roadPath(EDGE, building(other.buildingId).door));
         } else {
           pushPath(roadPath(building(curBuilding).door, building(other.buildingId).door));
         }
@@ -385,7 +387,7 @@ export class Game {
     }
     if (pts.length < 2) {
       // Local hop: tiny pulse at the building
-      const d = building(startDev.buildingId).door;
+      const d = startDev.hidden ? EDGE : building(startDev.buildingId).door;
       pts.push({ x: d.x + 0.5, y: d.y + 0.5 }, { x: d.x + 0.5, y: d.y + 0.2 });
     }
     const length = pathLength(pts);
@@ -441,7 +443,6 @@ export class Game {
 
   private enterStep() {
     this.stepEnteredAt = this.time;
-    this.flags.clear();
     const s = this.step;
     if (!s) return;
     this.focus = s.focus;
@@ -465,13 +466,19 @@ export class Game {
   advance() {
     if (this.mode !== "campaign" || this.progress.finished) return;
     const lesson = this.lesson;
+    const finishing = this.step;
+    // Evidence flags (pings run, pages fetched…) survive dialogue and concept cards, so acting on
+    // Rosa's advice before pressing Continue still counts. They reset once a task is done.
+    if (finishing?.kind === "task") this.flags.clear();
     if (this.progress.step + 1 < lesson.steps.length) {
       this.progress.step++;
     } else {
       if (!this.progress.completed.includes(lesson.id)) this.progress.completed.push(lesson.id);
       if (!this.notes.includes(lesson.id)) this.notes.push(lesson.id);
-      this.toast(`Lesson complete: ${lesson.title}`, "good");
-      if (this.progress.lesson + 1 < LESSONS.length) {
+      this.flags.clear();
+      const last = this.progress.lesson + 1 >= LESSONS.length;
+      this.events.emit("lessonComplete", { title: lesson.title, note: lesson.note, concept: lesson.concept, finished: last });
+      if (!last) {
         this.progress.lesson++;
         this.progress.step = 0;
       } else {
